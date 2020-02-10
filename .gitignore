@@ -1,0 +1,32 @@
+# OSX
+#
+.idea
+.DS_Store
+npm-debug.log
+npm-debug.log*
+coverage
+.nyc_output
+yarn.lock
+yarn-error.log
+lerna-debug.log
+.vscode/*
+testgrounds
+IntegrationTest
+integration_test
+package-lock.json
+
+# node.js
+#
+node_modules/
+npm-debug.log
+yarn-error.log
+
+# Gradle
+build/
+.gradle
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# Local project files
+workspace/*
