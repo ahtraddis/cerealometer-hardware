@@ -168,9 +168,8 @@ void(* resetDevice) (void) = 0;
 // Global functions
 
 int setWeight(String device_id, int slot, float weight_kg) {
-  // Open https connection to setWeight cloud function with site's certificate
-  // [eschwartz-TODO] Re-test with https.
-  //http.begin(REST_API_ENDPOINT, SHA1_FINGERPRINT);
+  // Open https connection to setWeight cloud function
+  // [eschwartz-TODO] Re-test with https, import SHA1_FINGERPRINT from config and add as 2nd param
   http.begin(REST_API_ENDPOINT);
   http.addHeader("Content-Type", "application/json");
   String data = String("{\"device_id\": \"") + device_id
@@ -569,7 +568,7 @@ void streamCallback(StreamData data) {
       // update slot status and LED state
       // [eschwartz-TODO] This assumes single digit slot number. Change to allow multi digit.
       uint8_t slot = data.dataPath().substring(6, 7).toInt();
-      if ((slot >= 0) && (slot <= PORT_COUNT)) {
+      if ((slot >= 0) && (slot < PORT_COUNT)) {
         byte status = statusStringToInt(data.stringData());
         ports[slot].status = status;
         setLedState(slot, statusToLedState(status));

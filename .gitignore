@@ -30,3 +30,5 @@ local.properties
 
 # Local project files
 workspace/*
+
+src/config_DUMMY.h
