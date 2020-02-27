@@ -8,6 +8,8 @@
 #define DEBUG false
 #define USE_FIREBASE
 
+#define BOOT_MESSAGE "Cerealometer v0.1 Copyright (c) 2020 Eric Schwartz"
+
 // These non-essential features are disabled due to limited flash memory on the
 // SparkFun Thing Dev board. Uncomment to enable them if your hardware so allows!
 //#define ENABLE_MDNS
@@ -33,13 +35,16 @@
 #include <ESP8266WebServer.h>
 #endif
 
-#include <HX711.h>
+#include "HX711-multi.h"
+
 #include "Statistic.h"
-#include "LedControl.h"
+#include <Wire.h> // Include the I2C library (required)
+#include <SparkFunSX1509.h>
+
 
 // Constants
 
-#define PORT_COUNT 3
+#define PORT_COUNT 6
 #define POUNDS_PER_KILOGRAM 2.20462262185
 #define WEIGHT_MEASURE_INTERVAL_MS 500
 #define STATS_WINDOW_LENGTH 10
@@ -47,32 +52,6 @@
 // Minimum change of averaged weight_kg required to trigger data upload
 #define KG_CHANGE_THRESHOLD 0.001
 #define STD_DEV_THRESHOLD 0.03
-// LED display
-#define DISPLAY_UPDATE_INTERVAL_MS 50
-#define DEFAULT_INTENSITY 8
-#define MAX_INTENSITY 15
-#define MATRIX_COLUMNS 6
-#define MATRIX_COLORS 3
-#define R 0
-#define G 1
-#define B 2
-#define R_SHIFT_1 7
-#define G_SHIFT_1 6
-#define B_SHIFT_1 5
-#define R_SHIFT_2 4
-#define G_SHIFT_2 3
-#define B_SHIFT_2 2
-// Bitmasks for byte values in display matrix array
-#define VAL_BITMASK   B00000001 // value (on/off) is the LSB
-#define FX_BITMASK    B00001110 // effect opcode bitmap
-#define DELAY_BITMASK B11110000 // delay or sequence value
-// Display effect opcodes
-#define FX_NONE 0
-#define FX_BLINK 1
-#define FX_BLINK_FAST 2
-// Divisors for opcode timing
-#define BLINK_DIVISOR 4
-#define FAST_BLINK_DIVISOR 1
 // Slot statuses
 #define STATUS_UNKNOWN 0
 #define STATUS_INITIALIZING 1
@@ -90,22 +69,67 @@
 #define LED_RED 6
 #define LED_RED_BLINK 7
 #define LED_RED_BLINK_FAST 8
-#define LED_GREEN 9
-#define LED_GREEN_BLINK 10
-#define LED_GREEN_BLINK_FAST 11
-#define LED_BLUE 12
-#define LED_BLUE_BLINK 13
-#define LED_BLUE_BLINK_FAST 14
-#define LED_WHITE 15
-#define LED_YELLOW 16
-#define LED_PURPLE 17
-#define LED_CYAN 18
+#define LED_RED_BREATHE 9
+#define LED_GREEN 10
+#define LED_GREEN_BLINK 11
+#define LED_GREEN_BLINK_FAST 12
+#define LED_GREEN_BREATHE 13
+#define LED_BLUE 14
+#define LED_BLUE_BLINK 15
+#define LED_BLUE_BLINK_FAST 16
+#define LED_BLUE_BREATHE 17
+#define LED_WHITE 18
+#define LED_WHITE_BLINK 19
+#define LED_WHITE_BLINK_FAST 20
+#define LED_YELLOW 21
+#define LED_PURPLE 22
+#define LED_CYAN 23
+
+// LED misc
+#define COLOR_COUNT 3
+#define R 0
+#define G 1
+#define B 2
+#define DEV 0 // array index for SX1509 device
+#define PIN 1 // array index for SX1509 pin
+#define BLINK_ON_MS 500
+#define BLINK_OFF_MS 500
+#define BLINK_FAST_ON_MS 150
+#define BLINK_FAST_OFF_MS 150
+#define BREATHE_ON_MS 1000
+#define BREATHE_OFF_MS 500
+#define BREATHE_RISE_MS 500
+#define BREATHE_FALL_MS 250
+
+// HX711 module pins (6 data lines, common clock)
+/**
+ * Note: GPIO15 (like GPIO0 and GPIO2) are also used to control boot options,
+ * and needs to be held LOW when read upon boot, otherwise the ESP8266 will
+ * try to boot from a non-existent SD card. Using the pin for the shared HX711
+ * clock instead data works around this, presumably because the signal toggles
+ * or becomes low when read upon boot. Not completely tested but seems stable.
+ * See https://www.instructables.com/id/ESP8266-Using-GPIO0-GPIO2-as-inputs/
+ */
+#define HX711_CLK 15 // GPIO15
+#define HX711_DT0 0 // GPIO0
+#define HX711_DT1 4 // GPIO4
+#define HX711_DT2 12 // GPIO12, MISO (Hardware SPI MISO)
+#define HX711_DT3 13 // GPIO13, MOSI (Hardware SPI MOSI)
+#define HX711_DT4 5 // GPIO5 (also tied to on-board LED)
+#define HX711_DT5 16 // GPIO16, XPD (can be used to wake from deep sleep)
+
+#define TARE_TIMEOUT_MS 2000 // less than ~3 secs to avoid tripping watchdog timer
+byte DOUTS[6] = {HX711_DT0, HX711_DT1, HX711_DT2, HX711_DT3, HX711_DT4, HX711_DT5};
+#define CHANNEL_COUNT sizeof(DOUTS) / sizeof(byte)
+long int scale_results[CHANNEL_COUNT];
+HX711MULTI scales(CHANNEL_COUNT, DOUTS, HX711_CLK);
 
 // Macros
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #define MAX(a,b) (((a)>(b))?(a):(b))
 
 // Globals
+
 #ifdef USE_WIFI_MULTI
 ESP8266WiFiMulti wifiMulti;
 #endif
@@ -119,26 +143,39 @@ FirebaseData firebaseData;
 
 HTTPClient http;
 
-// LedControl 4 params are: pins DATA IN, CLK, LOAD (/CS), and the number of cascaded devices
-LedControl lc = LedControl(16, 13, 12, 1);
-unsigned long lastDisplayUpdateMillis;
-unsigned long displayCounter = 0;
-// RGB color sequence used for display tests
-const static bool rgbSeq[7][3] = {
-  {1, 0, 0}, // red
-  {0, 1, 0}, // green
-  {0, 0, 1}, // blue
-  {1, 1, 1}, // white
-  {1, 1, 0}, // yellow
-  {1, 0, 1}, // purple
-  {0, 1, 1}, // cyan
+// SX1509 I/O expander array
+byte SX1509_I2C_ADDRESSES[2] = { 0x3E, 0x70 };
+#define SX1509_COUNT sizeof(SX1509_I2C_ADDRESSES) / sizeof(byte)
+// device and pins used for external interrupt to toggle nReset lines
+#define SX1509_INT_DEVICE 1
+#define SX1509_INT_PIN 0
+#define SX1509_INT_TRIGGER_PIN 1
+
+SX1509 io[SX1509_COUNT];
+// SX1509 device and pin mappings for the 6 RGB LEDs
+// Each pair represents {device, pin} for the LED pins in RGB order
+const int led_pins[PORT_COUNT][COLOR_COUNT][2] = {
+  { {0, 4}, {1, 4}, {0, 14} },
+  { {0, 5}, {1, 5}, {0, 15} },
+  { {0, 6}, {1, 6}, {1, 14} },
+  { {0, 7}, {1, 7}, {1, 15} },
+  { {0, 12}, {1, 12}, {0, 0} },
+  { {0, 13}, {1, 13}, {0, 1} },
 };
 
-// SparkFun Thing Dev board has enough I/O for 3 HX711 boards (reserving others for MAX7219).
-// This defines the pairs of clock and data pins wired up.
-byte hx711_clock_pins[PORT_COUNT] = { 0, 2, 15 };
-byte hx711_data_pins[PORT_COUNT] = { 4, 14, 5 };
-int hx711_calibration_factors[PORT_COUNT] = { -178000, -178000, -178000 };
+
+// // RGB color sequence used for display tests
+// const static bool rgbSeq[7][3] = {
+//   {1, 0, 0}, // red
+//   {0, 1, 0}, // green
+//   {0, 0, 1}, // blue
+//   {1, 1, 1}, // white
+//   {1, 1, 0}, // yellow
+//   {1, 0, 1}, // purple
+//   {0, 1, 1}, // cyan
+// };
+
+int hx711_calibration_factors[PORT_COUNT] = { -178000, -178000, -178000, -178000, -178000, -178000 };
 
 char buff[10];
 
@@ -146,7 +183,6 @@ typedef struct {
   int calibration_factor;
   float last_weight_kilograms; // last value uploaded
   float current_weight_kilograms; // most recent sample
-  HX711 scale;
   Statistic stats;
   byte data_pin;
   byte clock_pin;
@@ -155,8 +191,8 @@ typedef struct {
 } Port;
 
 Port ports[PORT_COUNT];
+byte currentLedStates[PORT_COUNT];
 
-byte matrix[MATRIX_COLORS][MATRIX_COLUMNS];
 #ifdef ENABLE_WEBSERVER
 void handleRoot();
 void handleNotFound();
@@ -164,6 +200,8 @@ void handleNotFound();
 
 // declare board reset function at address 0
 void(* resetDevice) (void) = 0;
+
+void ledBreatheRow(uint8_t colorIndex=0, int onIntensity=255, int delayMs=0, int delayStepMs=1);
 
 // Global functions
 
@@ -199,12 +237,6 @@ int setWeight(String device_id, int slot, float weight_kg) {
     Serial.println(http.errorToString(httpCode));
   }
   http.end();
-}
-
-void resetTares(void) {
-  for (uint8_t i = 0; i < PORT_COUNT; i++) {
-    ports[i].scale.tare();
-  }
 }
 
 void printCurrentValues(void) {
@@ -247,250 +279,362 @@ void restoreLedStates(void) {
 
 // Run LED test sequences
 void displayTest(void) {
-  uint8_t spaceDelayMs = 75;
-  for (uint8_t i = 0; i < 7; i++) {
-    ledFlashRight(rgbSeq[i][0], rgbSeq[i][1], rgbSeq[i][2], spaceDelayMs);
+  // resetDisplay();
+  // delay(500);
+  // ledBreatheRow(R);
+  // ledBreatheRow(G);
+  // ledBreatheRow(B);
+
+  for (uint8_t i = 0; i < PORT_COUNT; i++ ) {
+    //setLedState(i, (i < 2) ? LED_BLUE_BREATHE : LED_RED_BREATHE);
+    setLedState(i, LED_RED_BREATHE);
+    delay(1000);
   }
-  spaceDelayMs = 25;
-  for (uint8_t i = 0; i < 7; i++) {
-    ledFadeUpRow(rgbSeq[i][0], rgbSeq[i][1], rgbSeq[i][2], spaceDelayMs);
-    ledFadeDownRow(rgbSeq[i][0], rgbSeq[i][1], rgbSeq[i][2], spaceDelayMs);
-  }
-  lc.setIntensity(0, MAX_INTENSITY);
-  ledRandom(25, 200);
-  ledFadeAll(25);
-  delay(500); // pause before restoring normal state
-  lc.setIntensity(0, DEFAULT_INTENSITY);
-  zeroMatrix();
-  restoreLedStates();
+  //restoreLedStates();
 }
 
 void ledFadeAll(int delayMs) {
-  for (uint8_t i = 15; i > 0; i--) {
-    lc.setIntensity(0, i);
+  
+}
+
+void resetDisplay() {
+  // setting up for analog writes for now
+  for (uint8_t pos = 0; pos < PORT_COUNT; pos++) {
+    setLedState(pos, LED_OFF);
+  }
+}
+
+void ledBreatheRow(uint8_t colorIndex, int onIntensity, int delayMs, int delayStepMs)
+{
+  for (uint8_t pos = 0; pos < PORT_COUNT; pos++) {
+    int device = led_pins[pos][colorIndex][DEV];
+    int pin = led_pins[pos][colorIndex][PIN];
+    io[device].pinMode(pin, ANALOG_OUTPUT);
+    for (int i = 0; i < (onIntensity + 1); i++) {
+      io[device].analogWrite(pin, 255 - i);
+      delay(delayStepMs);
+    }
+    delay(delayMs);
+    for (int i = onIntensity; i >= 0; i--) {
+      io[device].analogWrite(pin, 255 - i);
+      delay(delayStepMs);
+    }
     delay(delayMs);
   }
-  lc.shutdown(0, true);
-  delay(delayMs);
-  zeroMatrix();
-  updateDisplay();
-  lc.shutdown(0, false);
 }
 
 void ledFadeUpRow(boolean r, boolean g, boolean b, int delayMs) {
-  // power off while writing data
-  lc.shutdown(0, true);
-  for (uint8_t i = 0; i < MATRIX_COLUMNS; i++) {
-    matrix[R][i] = r;
-    matrix[G][i] = g;
-    matrix[B][i] = b;
-  }
-  updateDisplay();
-  lc.setIntensity(0, 0);
-  lc.shutdown(0, false);
-  for (uint8_t i = 0; i < 16; i++) {
-    lc.setIntensity(0, i);
-    delay(delayMs);
-  }
+  
 }
 
 void ledFadeDownRow(boolean r, boolean g, boolean b, int delayMs) {
-  for (uint8_t i = 0; i < MATRIX_COLUMNS; i++) {
-    matrix[R][i] = r;
-    matrix[G][i] = g;
-    matrix[B][i] = b;
-  }
-  updateDisplay();
-  for (uint8_t i = 15; i > 0; i--) {
-    lc.setIntensity(0, i);
-    delay(delayMs);
-  }
-  lc.shutdown(0, true);
-  delay(delayMs);
-  zeroMatrix();
-  updateDisplay();
-  lc.shutdown(0, false);
+  
 }
 
 void ledRandom(int delayMs, int maxCount) {
   int counter = 0;
   while (counter++ < maxCount) {
-    uint8_t column = random(0, MATRIX_COLUMNS);
     uint8_t rgbIndex = random(0, 7);
-    matrix[R][column] = rgbSeq[rgbIndex][0];
-    matrix[G][column] = rgbSeq[rgbIndex][1];
-    matrix[B][column] = rgbSeq[rgbIndex][2];
-    updateDisplay();
+    // matrix[R][column] = rgbSeq[rgbIndex][0];
+    // matrix[G][column] = rgbSeq[rgbIndex][1];
+    // matrix[B][column] = rgbSeq[rgbIndex][2];
+    // updateDisplay();
     delay(delayMs);
   }
 }
 
 void ledFlashRight(boolean r, boolean g, boolean b, int delayMs) {
-  for (uint8_t i = 0; i < MATRIX_COLUMNS; i++) {
-    matrix[R][i] = r;
-    matrix[G][i] = g;
-    matrix[B][i] = b;
-    updateDisplay();
-    delay(delayMs);
-    matrix[R][i] = 0;
-    matrix[G][i] = 0;
-    matrix[B][i] = 0;
+  for (uint8_t i = 0; i < PORT_COUNT; i++) {
+    
+    //delay(delayMs);
+    
   }
 }
 
 void ledFlashLeft(boolean r, boolean g, boolean b, int delayMs) {
-  for (uint8_t i = (MATRIX_COLUMNS - 1); i > 0; i--) {
-    matrix[R][i] = r;
-    matrix[G][i] = g;
-    matrix[B][i] = b;
-    updateDisplay();
-    delay(delayMs);
-    matrix[R][i] = 0;
-    matrix[G][i] = 0;
-    matrix[B][i] = 0;
+  for (uint8_t i = (PORT_COUNT - 1); i > 0; i--) {
+    
+    //delay(delayMs);
+    
   }
 }
 
-// Set LED state and timing values in display matrix
+// Set LED state
+// To stop blink:
+// io[device].setupBlink(pin, 0, 0, 255);
+// See https://forum.sparkfun.com/viewtopic.php?t=48433)
+// Notes:
+// To stop a pin that is "breathing", do a digitalWrite() of HIGH to enter single-shot mode.
 void setLedState(uint8_t pos, uint8_t state) {
-  uint8_t rVal = 0, gVal = 0, bVal = 0,
-    rOpcode = FX_NONE, gOpcode = FX_NONE, bOpcode = FX_NONE,
-    rDivisor = 0, gDivisor = 0, bDivisor = 0;
-  // For blink effect, align initial on/off state with even values of displayCounter
-  // so all LEDs blinking at the same rate are in phase with each other
+  if (state == currentLedStates[pos]) return; // already set
+  int device;
+  int pin;
   switch (state) {
     case LED_RED:
     case LED_LOADED:
-      rVal = 1; // solid red ala Whole Foods parking lot
+      // solid red ala Whole Foods parking lot
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
       break;
     case LED_RED_BLINK:
     case LED_UNLOADED:
-      rVal = displayCounter % 2;
-      rOpcode = FX_BLINK;
-      rDivisor = BLINK_DIVISOR;
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
       break;
     case LED_RED_BLINK_FAST:
     case LED_CLEARING:
-      rVal = displayCounter % 2;
-      rOpcode = FX_BLINK_FAST;
-      rDivisor = FAST_BLINK_DIVISOR;
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].blink(pin, BLINK_FAST_ON_MS, BLINK_FAST_OFF_MS); // start blink
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
+      // blue
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
+      break;
+    case LED_RED_BREATHE:
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].breathe(pin, BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS); // start breathe
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
       break;
     case LED_GREEN:
     case LED_VACANT:
-      gVal = 1; // solid green ala Whole Foods parking lot
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      // solid green ala Whole Foods parking lot
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
       break;
     case LED_GREEN_BLINK:
-      gVal = displayCounter % 2;
-      gOpcode = FX_BLINK;
-      gDivisor = BLINK_DIVISOR;
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
       break;
     case LED_GREEN_BLINK_FAST:
-      gVal = displayCounter % 2;
-      gOpcode = FX_BLINK_FAST;
-      gDivisor = FAST_BLINK_DIVISOR;
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].blink(pin, BLINK_FAST_ON_MS, BLINK_FAST_OFF_MS); // start blink
+      // blue
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
+      break;
+    case LED_GREEN_BREATHE:
+    case LED_INITIALIZING:
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      io[device].breathe(pin, BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS); // start breathe
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
       break;
     case LED_BLUE:
-      rVal = 0; // solid blue
-      gVal = 0;
-      bVal = 1;
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      // blue
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
       break;
     case LED_BLUE_BLINK:
-      bVal = displayCounter % 2;
-      bOpcode = FX_BLINK;
-      bDivisor = BLINK_DIVISOR;
-      break;
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
+      break;    
     case LED_BLUE_BLINK_FAST:
-      bVal = displayCounter % 2;
-      bOpcode = FX_BLINK_FAST;
-      bDivisor = FAST_BLINK_DIVISOR;
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
+      break;
+    case LED_BLUE_BREATHE:
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].digitalWrite(pin, LOW); // off
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].breathe(pin, BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS); // start breathe
       break;
     case LED_WHITE:
-    case LED_INITIALIZING:
-      rVal = 1; // solid white
-      gVal = 1;
-      bVal = 1;
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
       break;
-    case LED_YELLOW:
-      rVal = 1; // solid yellow
-      gVal = 1;
-      bVal = 0;
+    case LED_WHITE_BLINK:
+      // red
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
+      // green
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
+      // blue
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
       break;
-    case LED_PURPLE:
-      rVal = 1; // solid purple
-      gVal = 0;
-      bVal = 1;
-      break;
-    case LED_CYAN:
-      rVal = 0; // solid cyan
-      gVal = 1;
-      bVal = 1;
-      break;
+    // case LED_YELLOW:
+    //   // do something
+    //   break;
+    // case LED_PURPLE:
+    //   // do something
+    //   break;
+    // case LED_CYAN:
+    //   // do something
+    //   break;
     case LED_OFF:
     default:
-      rVal = 0;
-      gVal = 0;
-      bVal = 0;
+      device = led_pins[pos][R][DEV];
+      pin = led_pins[pos][R][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      device = led_pins[pos][G][DEV];
+      pin = led_pins[pos][G][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
+      io[device].digitalWrite(pin, HIGH); // stop breathe
+      io[device].setupBlink(pin, 0, 0, 255); // stop blink
       break;
   }
-  matrix[R][pos] = rVal | (rOpcode << 1) | (rDivisor << 4);
-  matrix[G][pos] = gVal | (gOpcode << 1) | (gDivisor << 4);
-  matrix[B][pos] = bVal | (bOpcode << 1) | (bDivisor << 4);
-  updateDisplay();
-}
-
-void updateDisplay() {
-  // Loop through display matrix data, apply FX if opcode and divisor are present
-  for (uint8_t color = 0; color < MATRIX_COLORS; color++) {
-    for (uint8_t column = 0; column < MATRIX_COLUMNS; column++) {
-      byte val = matrix[color][column] & VAL_BITMASK;
-      byte opcode = (matrix[color][column] & FX_BITMASK) >> 1;
-      byte divisor = (matrix[color][column] & DELAY_BITMASK) >> 4;
-
-      if ((opcode == FX_BLINK) || (opcode == FX_BLINK_FAST)) {
-        if ((displayCounter % divisor) == 0) {
-          val = 1 - val; // toggle value
-        }
-      }
-      matrix[color][column] = val | (opcode << 1) | (divisor << 4);
-    }
-  }
-  // Transform logical array (6 LEDs x 1 row) to hardware I/O (6 color bits x 3 rows)
-  byte row0 =
-    ((matrix[R][0] & VAL_BITMASK) << R_SHIFT_1) |
-    ((matrix[G][0] & VAL_BITMASK) << G_SHIFT_1) |
-    ((matrix[B][0] & VAL_BITMASK) << B_SHIFT_1) |
-    ((matrix[R][1] & VAL_BITMASK) << R_SHIFT_2) |
-    ((matrix[G][1] & VAL_BITMASK) << G_SHIFT_2) |
-    ((matrix[B][1] & VAL_BITMASK) << B_SHIFT_2);
-  byte row1 =
-    ((matrix[R][2] & VAL_BITMASK) << R_SHIFT_1) |
-    ((matrix[G][2] & VAL_BITMASK) << G_SHIFT_1) |
-    ((matrix[B][2] & VAL_BITMASK) << B_SHIFT_1) |
-    ((matrix[R][3] & VAL_BITMASK) << R_SHIFT_2) |
-    ((matrix[G][3] & VAL_BITMASK) << G_SHIFT_2) |
-    ((matrix[B][3] & VAL_BITMASK) << B_SHIFT_2);
-  byte row2 =
-    ((matrix[R][4] & VAL_BITMASK) << R_SHIFT_1) |
-    ((matrix[G][4] & VAL_BITMASK) << G_SHIFT_1) |
-    ((matrix[B][4] & VAL_BITMASK) << B_SHIFT_1) |
-    ((matrix[R][5] & VAL_BITMASK) << R_SHIFT_2) |
-    ((matrix[G][5] & VAL_BITMASK) << G_SHIFT_2) |
-    ((matrix[B][5] & VAL_BITMASK) << B_SHIFT_2);
-  // Write to display
-  lc.setRow(0, 0, row0);
-  lc.setRow(0, 1, row1);
-  lc.setRow(0, 2, row2);
-}
-
-// Write zeros to logical display matrix
-void zeroMatrix(void) {
-  for (uint8_t color = 0; color < MATRIX_COLORS; color++) {
-    for (uint8_t column = 0; column < MATRIX_COLUMNS; column++) {
-      matrix[color][column] = 0;
-      matrix[color][column] = 0;
-      matrix[color][column] = 0;
-    }
-  }
+  currentLedStates[pos] = state;
+  syncLeds();
 }
 
 byte statusToLedState(byte status) {
@@ -680,41 +824,104 @@ void displayHtml() {
 }
 #endif
 
+void tare() {
+  bool tareSuccessful = false;
+  unsigned long tareStartTime = millis();
+  while (!tareSuccessful && millis() < (tareStartTime + TARE_TIMEOUT_MS)) {
+    tareSuccessful = scales.tare(20, 10000);  // reject 'tare' if still ringing
+  }
+  Serial.print("tare() ");
+  Serial.println(tareSuccessful ? "SUCCESS" : "FAIL");
+}
+
+/**
+ * Reset SX1509 internal counters to synchronize LED operation (blinking, fading)
+ * across multiple devices. This is a modification of sync() in the SX1509 library,
+ * using one of the SX1509 interrupt outputs to toggle the shared nReset lines.
+ * Note: Requires moving readByte() and writeByte() to public in SX1509 class.
+ */
+void syncLeds() {
+  #define REG_MISC 0x1F // RegMisc Miscellaneous device settings register 0000 0000
+
+  // First set nReset functionality (reset counters instead of POR) on each SX1509
+  byte regMisc;
+  for (uint8_t i = 0; i < SX1509_COUNT; i++) {
+    regMisc = io[i].readByte(REG_MISC);
+    if (!(regMisc & 0x04)) {
+      regMisc |= (1<<2);
+      io[i].writeByte(REG_MISC, regMisc);
+    }
+  }
+
+  // clear any pending interrupt
+  unsigned int intStatus = io[SX1509_INT_DEVICE].interruptSource();  
+  // Write a LOW (wired to SX1509_INT_PIN) to trigger the falling edge interrupt
+  io[SX1509_INT_DEVICE].digitalWrite(SX1509_INT_TRIGGER_PIN, LOW);
+  delay(1);
+  io[SX1509_INT_DEVICE].digitalWrite(SX1509_INT_TRIGGER_PIN, HIGH);
+
+	// Return nReset to POR functionality on each SX1509
+  for (uint8_t i = 0; i < SX1509_COUNT; i++) {
+    regMisc = io[i].readByte(REG_MISC);
+    io[i].writeByte(REG_MISC, (regMisc & ~(1<<2)));
+  }
+}
+
 void setup(void) {
   Serial.begin(115200);
   delay(10);
   Serial.println('\n');
+  Serial.println(BOOT_MESSAGE);
+  Serial.flush();
 
-  // Switch display from power savings mode to normal operation
-  lc.shutdown(0, false);
-  lc.setIntensity(0, DEFAULT_INTENSITY);
-  lc.clearDisplay(0);
-  zeroMatrix();  
+  // [eschwartz-TODO] Commenting out to test reboot scenarios
+  //tare(); // reset scales to 0
+
+  // Initialize SX1509 I/O expanders
+  for (uint8_t i = 0; i < SX1509_COUNT; i++) {
+    Serial.print("Initializing SX1509 device ");
+    Serial.print(i);
+    Serial.print(" at address 0x");
+    Serial.print(SX1509_I2C_ADDRESSES[i], HEX);
+    Serial.print("...");
+    if (!io[i].begin(SX1509_I2C_ADDRESSES[i])) {
+      Serial.println(" FAILED");
+      // [eschwartz-TODO] Set flag to skip I/O stuff
+    } else {
+      Serial.println(" success");
+    }
+  }
+  // Set output freq.: 0x0: 0Hz (low), 0xF: 2MHz? (high),
+  // 0x1-0xE: fOSCout = Fosc / 2 ^ (outputFreq - 1) Hz
+  byte outputFreq = 0xF;
+  io[0].clock(INTERNAL_CLOCK_2MHZ, 2, OUTPUT, outputFreq);
+  io[1].clock(EXTERNAL_CLOCK, 2, INPUT);
+
+  // Setup input pin to trigger external interrupt on shared nReset lines
+  io[SX1509_INT_DEVICE].pinMode(SX1509_INT_PIN, INPUT_PULLUP);
+  io[SX1509_INT_DEVICE].enableInterrupt(SX1509_INT_PIN, FALLING);
+  // Setup an output pin (wired to SX1509_INT_PIN) to trigger it
+  io[SX1509_INT_DEVICE].pinMode(SX1509_INT_TRIGGER_PIN, OUTPUT);
+
+  // Set up all LED pins as ANALOG_OUTPUTs
+  for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
+    for (uint8_t color = 0; color < COLOR_COUNT; color++) {
+      uint8_t device = led_pins[pos][color][DEV];
+      uint8_t pin = led_pins[pos][color][PIN];
+      io[device].pinMode(pin, ANALOG_OUTPUT);      
+    }
+  }
+
   displayTest();
 
   // Initialize port structs
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
-    ports[i].clock_pin = hx711_clock_pins[i];
-    ports[i].data_pin = hx711_data_pins[i];
-    ports[i].calibration_factor = hx711_calibration_factors[i];
     ports[i].last_weight_kilograms = 0;
     ports[i].lastWeightMeasurementPushMillis = 0;
+    // Set initial status and LED state until data is received from cloud
     ports[i].status = STATUS_INITIALIZING;
     setLedState(i, statusToLedState(STATUS_INITIALIZING));
-
-    Serial.print("Setting up HX711 scale ");
-    Serial.print(i);
-    Serial.print(" on I/O pins ");
-    Serial.print(ports[i].clock_pin);
-    Serial.print(" (clock) and ");
-    Serial.print(ports[i].data_pin);
-    Serial.println(" (data)");
-    ports[i].scale.begin(ports[i].data_pin, ports[i].clock_pin);
-    ports[i].scale.set_scale();
-    ports[i].scale.tare();
     ports[i].stats.clear();
-    ports[i].status = STATUS_UNKNOWN; // initial status until data received from cloud
-    setLedState(i, statusToLedState(STATUS_UNKNOWN));
   }
 
   Serial.print("Connecting to WiFi...");
@@ -736,8 +943,7 @@ void setup(void) {
   }
   #endif
   
-  Serial.println('\n');
-  Serial.print("Connected to ");
+  Serial.print("\nConnected to ");
   Serial.println(WiFi.SSID());
   Serial.print("IP address: ");
   Serial.println(WiFi.localIP());
@@ -760,7 +966,8 @@ void setup(void) {
   Serial.println("HTTP server started");
   #endif
   
-  Serial.println(F("Commands: [R|r] Reset board, [D|d] Display test, [T|t] Reset tares, [P|p] Print current values"));
+  Serial.println(F("Commands: [R] Reboot board, [D] Run display tests, [S] Sync LED timing, [T] Reset tares, [P] Print current values"));
+  Serial.println(F("Display tests: [0] Red, [1] Green, [2] Blue, [3] White"));
 
   #ifdef USE_FIREBASE
   Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
@@ -789,18 +996,13 @@ void loop(void) {
   // Listen for HTTP requests from clients
   server.handleClient();
   #endif
-  if ((millis() - lastDisplayUpdateMillis) >= DISPLAY_UPDATE_INTERVAL_MS) {
-    displayCounter++; 
-    updateDisplay();
-    lastDisplayUpdateMillis = millis();
-  }
+
+  scales.read(scale_results);
 
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
     float kg_change = 0;
-    // Calibrate scale
-    ports[i].scale.set_scale(ports[i].calibration_factor);
-    // Get current weight reading and convert to kg (absolute value)
-    float weight_pounds = ports[i].scale.get_units();
+    // Get current weight reading (signed integer), apply calibratation
+    float weight_pounds = 1.0 * scale_results[i] / hx711_calibration_factors[i];
     float weight_kilograms = MAX(weight_pounds / POUNDS_PER_KILOGRAM, 0);
     // Add current reading to stats arrays
     ports[i].stats.add(weight_kilograms);
@@ -843,20 +1045,48 @@ void loop(void) {
     char key = Serial.read();
     if (key == 't' || key == 'T') {
       Serial.println("Resetting scales to 0...");
-      resetTares();
+      tare();
     }
     if (key == 'r' || key == 'R') {
-      Serial.println("Resetting device...");
+      Serial.println("Rebooting device...");
       resetDevice();
     }
     if (key == 'p' || key == 'P') {
-      Serial.println("Printing current values...");
+      Serial.println("Printing current weight values...");
       printCurrentValues();
+    }
+    if (key == 's' || key == 'S') {
+      Serial.println("Synchronizing all LED outputs...");
+      syncLeds();
     }
     if (key == 'd' || key == 'D') {
       Serial.println("Running display tests...");
       displayTest();
       Serial.println("...done.");
+    }
+    if (key == '0') {
+      Serial.println("Setting all LEDs to LED_RED_BLINK state...");
+      for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
+        setLedState(pos, LED_RED_BLINK);
+      }
+    }
+    if (key == '1') {
+      Serial.println("Setting all LEDs to LED_GREEN_BLINK state...");
+      for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
+        setLedState(pos, LED_GREEN_BLINK);
+      }
+    }
+    if (key == '2') {
+      Serial.println("Setting all LEDs to LED_BLUE_BLINK state...");
+      for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
+        setLedState(pos, LED_BLUE_BLINK);
+      }
+    }
+    if (key == '3') {
+      Serial.println("Setting all LEDs to LED_WHITE state...");
+      for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
+        setLedState(pos, LED_WHITE);
+      }
     }
   }
 }
