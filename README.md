@@ -16,7 +16,8 @@ For general info about the Cerealometer app and its infrastructure, visit the [m
 * Libraries used: [HX711](https://github.com/bogde/HX711), [FirebaseESP8266](https://github.com/mobizt/Firebase-ESP8266), [Statistic](https://playground.arduino.cc/Main/Statistics/), [LedControl](http://wayoda.github.io/LedControl/index.html)
 * Configuring Visual Studio Code for Arduino Development ([YouTube](https://www.youtube.com/watch?v=FnEvJXpxxNM))
 * Direct db access via Firebase used for realtime advantage, esp. to subscribe to events driven by app usage and avoid polling.
-* Challenges: setting tare weight (no data online!) and resetting scales on powerup when items are present (can't tare)
+* Challenges: setting tare weight (no data online!) and resetting scales on powerup when items are present (can't tare).
+* Caption: This is a tareable product.
 
 ## Photos
 
@@ -25,7 +26,7 @@ For general info about the Cerealometer app and its infrastructure, visit the [m
 	<img width="300" src="images/hardware/inside.jpg" />
 	<img width="300" src="images/hardware/pantry.jpg" />
 </div>
-<sub>Parking your cereal is just like at Whole Foods: Red = Occupied, Green = Vacant!</sub>
+<sub>Parking your cereal is just like at the Whole Foods parking garage: Red = Occupied, Green = Vacant!</sub>
 
 ## Overview/Challenge
 - Track the weight changes in each port and send the data to the cloud
