@@ -38,9 +38,11 @@
 #include "HX711-multi.h"
 
 #include "Statistic.h"
-#include <Wire.h> // Include the I2C library (required)
+// [eschwartz-TODO] Commenting out (ok so far, probably included elsewhere)
+//#include <Wire.h> // Include the I2C library (required)
 #include <SparkFunSX1509.h>
 #include <jsonlib.h>
+#include <EEPROM.h>
 
 // Constants
 
@@ -48,6 +50,7 @@
 #define WEIGHT_MEASURE_INTERVAL_MS 500
 #define STATS_WINDOW_LENGTH 10
 #define PRESENCE_THRESHOLD_KG 0.001
+#define CALIBRATION_WEIGHT_KG 0.1
 // Minimum change of averaged weight_kg required to trigger data upload
 #define KG_CHANGE_THRESHOLD 0.001
 #define STD_DEV_THRESHOLD 0.03
@@ -128,6 +131,9 @@ HX711MULTI scales(CHANNEL_COUNT, DATA_OUTS, HX711_CLK);
 #define MAX(a,b) (((a)>(b))?(a):(b))
 #define LEN(arr) ((int) (sizeof(arr) / sizeof(arr)[0]))
 
+#define EEPROM_ADDR 0
+#define EEPROM_LEN 512
+
 // Globals
 
 #ifdef USE_WIFI_MULTI
@@ -174,15 +180,27 @@ const static bool rgbSeq[][COLOR_COUNT] = {
   { 0, 1, 1 }, // cyan
 };
 
-// Hardcoded load cell offsets and calibration factors, to be written to flash.
+// Load cell offsets and calibration factors, retrieved from flash.
 // Tare offset corresponds to the HX711 value when load is zero.
-int hx711_tare_offsets[PORT_COUNT] = { 4288, 182437, 16573, 80423, -123745, 201301 };
+long int hx711_tare_offsets[PORT_COUNT] = {0};
 // Calibration factor is the linear conversion factor to scale value to kilograms.
-int hx711_calibration_factors[PORT_COUNT] = { -392309, -393188, -392518, -373189, -372550, -384838 };
+int hx711_calibration_factors[PORT_COUNT] = {0};
 
 char buff[10];
 boolean enablePrintScaleData = false;
 boolean enableLogData = false;
+boolean enableLogUpdates = false;
+uint8_t slotSelected = 0;
+
+typedef struct {
+  char device_id[30] = "";
+  char wifi_ssid[30] = "";
+  char wifi_password[30] = "";
+  long offsets[PORT_COUNT] = {0};
+  int calibration_factors[PORT_COUNT] = {0};
+} EepromData;
+
+EepromData eepromData;
 
 typedef struct {
   int calibration_factor;
@@ -213,31 +231,35 @@ void ledWaveRight(boolean r=0, boolean g=0, boolean b=0, int delayMs=100);
 void ledRandom(int maxCount=1, int delayMs=0, int delayStepMs=1);
 void setLedState(uint8_t pos, uint8_t state=LED_OFF, boolean sync=true);
 void ledCylon(int count=10, int delayMs=150);
+void getAverageScaleData(long *result, byte times=10);
 
 // Global functions
 
 int getPortData(String device_id) {
+  Serial.print("Fetching initial port data...");
   http.begin(REST_API_BASEURL + String("/getDevice?device_id=") + device_id);
   http.addHeader("Content-Type", "application/json");
   int httpCode = http.GET();
   if (httpCode == HTTP_CODE_OK) {
-    Serial.print(F("HTTP response code "));
-    Serial.println(httpCode);
+    Serial.println(" success.");
     String response = http.getString();
     String data_list = jsonExtract(response, "data");
     // Parse response, set status and LED state for each slot
     // [eschwartz-TODO] Only do this if len of array == PORT_COUNT
     for (uint8_t i = 0; i < PORT_COUNT; i++) {
       String slotStr = jsonIndexList(data_list, i);
-      Serial.print("slot " + String(i) + ": ");
-      Serial.println(slotStr);
+      if (DEBUG) {
+        Serial.print("slot " + String(i) + ": ");
+        Serial.println(slotStr);
+      }
       String statusStr = jsonExtract(slotStr, "status");
       byte status = statusStringToInt(statusStr);
       ports[i].status = status;
       setLedState(i, status);
     }
   } else {
-    Serial.print(F("HTTP response error "));
+    Serial.println(" FAILED.");
+    Serial.print("HTTP response error ");
     Serial.println(httpCode);
     String response = http.getString();
     Serial.println(response);
@@ -261,19 +283,19 @@ int setWeight(String device_id, int slot, float weight_kg) {
   if (httpCode > 0) {
     if (DEBUG) {
       String payload = http.getString(); // response payload 
-      Serial.print(F("Slot "));
+      Serial.print("Slot ");
       Serial.print(slot);
-      Serial.print(F(" setWeight SUCCESS, httpCode = "));
+      Serial.print(" setWeight SUCCESS, httpCode = ");
       Serial.println(httpCode);
       //Serial.print("response: ");
       //Serial.println(payload);
     }
   } else {
-    Serial.print(F("Slot "));
+    Serial.print("Slot ");
     Serial.print(slot);
-    Serial.print(F(" setWeight FAILED: httpCode = "));
+    Serial.print(" setWeight FAILED: httpCode = ");
     Serial.print(httpCode);
-    Serial.print(F(", error = "));
+    Serial.print(", error = ");
     Serial.println(http.errorToString(httpCode));
   }
   http.end();
@@ -789,12 +811,12 @@ byte statusStringToInt(String status) {
 
 void streamCallback(StreamData data) {
   if (DEBUG) {
-    Serial.println(F("___________ Stream callback data received __________"));
+    Serial.println("___________ Stream callback data received __________");
     Serial.println("streamPath: " + data.streamPath());
     Serial.println("dataPath:   " + data.dataPath());
     Serial.println("dataType:   " + data.dataType());
     Serial.println("eventType:  " + data.eventType());
-    Serial.print(F(  "value:      "));
+    Serial.print(  "value:      ");
   }
   if (data.dataType() == "int") {
     if (DEBUG) Serial.println(data.intData());
@@ -841,7 +863,6 @@ void streamCallback(StreamData data) {
       }
     }
   }
-  //Serial.println("____________________________________________________");
 }
 
 void streamTimeoutCallback(bool timeout) {
@@ -928,27 +949,78 @@ void displayHtml() {
 #endif
 
 void printCommandMenu() {
-  Serial.println(F("COMMANDS: [H] Help [R] Reboot [D] Display tests [S] Sync LEDs"));
-  Serial.println(F("[W] Toggle scale data log [P] Toggle port data log"));
-  Serial.println(F("[0] Restore LED state [1] Blink reds [2] Blink greens [3] Blink blues"));
-  Serial.println(F("[4] Whites on [5] Wave red [6] Wave green [7] Wave blue"));
+  Serial.println("COMMANDS:");
+  Serial.println("[H] Help [R] Reboot [D] Display tests [W] Write EEPROM");
+  Serial.println("[S] Toggle scale data log [P] Toggle port data log [L] Toggle update log");
+  Serial.println("[0] Restore LED state [1] Blink reds [2] Blink greens [3] Blink blues");
+  Serial.println("[4] Whites on [5] Wave red [6] Wave green [7] Wave blue");
+  Serial.println("[O] Calib offsets [+] Select slot (+) [-] Select slot (-) [F] Calib slot " + String(slotSelected));
+  Serial.println("Debugging: eepromData (use W to commit changes):");
+  printEepromData();
 }
 
-// Note: Tare not used since device needs to be able to boot with load present.
-// Using hardcoded offsets and calibration factors instead.
-// void tare() {
-//   bool tareSuccessful = false;
-//   unsigned long tareStartTime = millis();
-//   while (!tareSuccessful && millis() < (tareStartTime + TARE_TIMEOUT_MS)) {
-//     tareSuccessful = scales.tare(20, 10000);  // reject 'tare' if still ringing
-//   }
-//   Serial.print("tare() ");
-//   Serial.println(tareSuccessful ? "SUCCESS" : "FAIL");
-// }
+void calibrateOffsets() {
+  long int results[PORT_COUNT] = {0};
+  Serial.println("Calibrating offsets: sampling averages...");
+  getAverageScaleData(results, 10);
+  for (uint8_t i = 0; i < PORT_COUNT; i++) {
+    hx711_tare_offsets[i] = results[i];
+    // stage data for writing
+    eepromData.offsets[i] = results[i];
+  }
+}
+
+void calibrateScaleFactor(uint8_t slot) {
+  long int results[PORT_COUNT] = {0};
+  Serial.println("Calibrating scale factor for Slot " + String(slot));
+  getAverageScaleData(results, 10);
+  hx711_calibration_factors[slot] = 1.0 * (results[slot] - hx711_tare_offsets[slot]) / CALIBRATION_WEIGHT_KG;
+  for (uint8_t i = 0; i < PORT_COUNT; i++) {
+    // stage data for writing
+    eepromData.calibration_factors[i] = hx711_calibration_factors[i];
+  }
+}
+
+void getAverageScaleData(long *result, byte times) {
+  long values[PORT_COUNT];
+  uint8_t count, i;
+  Statistic calStats[PORT_COUNT];
+
+  for (i = 0; i < scales.get_count(); i++) {
+    calStats[i].clear();
+  }
+
+  for (count = 0; count < times; count++) {
+    scales.read(values);
+    for (i = 0; i < scales.get_count(); i++) {
+      calStats[i].add(values[i]);
+    }
+  }
+  Serial.println("Slot\tCount\tAvg\tMin\tMax\tStdev");
+  Serial.println("----\t-----\t---\t---\t---\t-----");
+  for (i = 0; i < scales.get_count(); i++) {
+    Serial.print(i);
+    Serial.print('\t');
+    Serial.print(calStats[i].count());
+    Serial.print('\t');
+    Serial.print((int)calStats[i].average());
+    Serial.print('\t');
+    Serial.print(calStats[i].minimum(), 0);
+    Serial.print('\t');
+    Serial.print(calStats[i].maximum(), 0);
+    Serial.print('\t');
+    Serial.println(calStats[i].pop_stdev(), 0);
+  }
+
+	// set the offsets
+	for (i = 0; i < PORT_COUNT; i++) {
+		result[i] = (int)calStats[i].average();
+	}
+}
 
 void printScaleData() {
   scales.read(scale_results);
-  for (int i = 0; i < scales.get_count(); ++i) {
+  for (uint8_t i = 0; i < scales.get_count(); ++i) {
     Serial.print(scale_results[i]);
     Serial.print("\t (");
     Serial.print(1.0 * (scale_results[i] - hx711_tare_offsets[i]) / hx711_calibration_factors[i], 4);
@@ -990,6 +1062,61 @@ void syncLeds() {
   }
 }
 
+void printEepromData() {
+  Serial.println("device_id:     '" + String(eepromData.device_id) + "'");
+  Serial.println("wifi_ssid:     '" + String(eepromData.wifi_ssid) + "'");
+  Serial.println("wifi_password: '" + String(eepromData.wifi_password) + "'");
+  Serial.println("Slot\tOffset\tCal factor");
+  Serial.println("----\t------\t----------");
+  for (uint8_t i = 0; i < PORT_COUNT; i++) {
+    Serial.print(i);
+    Serial.print('\t');
+    Serial.print(eepromData.offsets[i]);
+    Serial.print('\t');
+    Serial.print(eepromData.calibration_factors[i]);
+    Serial.println();
+  }
+}
+
+void readEeprom() {
+  Serial.println("Reading EEPROM data...");
+  EEPROM.begin(EEPROM_LEN);
+  EEPROM.get(EEPROM_ADDR, eepromData);
+  printEepromData();
+  for (uint8_t i = 0; i < PORT_COUNT; i++) {
+    hx711_tare_offsets[i] = eepromData.offsets[i];
+    hx711_calibration_factors[i] = eepromData.calibration_factors[i];
+  }
+}
+
+void writeEeprom() {
+  Serial.print("Writing EEPROM data to addr 0x");
+  Serial.println(EEPROM_ADDR, HEX);
+  // copy hardcoded config.h data for now
+  strncpy(eepromData.device_id, DEVICE_ID, 30);
+  strncpy(eepromData.wifi_ssid, WIFI_NETWORKS[0][0], 30);
+  strncpy(eepromData.wifi_password, WIFI_NETWORKS[0][1], 30);
+  printEepromData();
+  // commit EEPROM_LEN bytes of ESP8266 flash (for "EEPROM" emulation)
+  // this step actually loads the content (EEPROM_LEN bytes) of flash into 
+  // a EEPROM_LEN-byte-array cache in RAM
+  EEPROM.begin(EEPROM_LEN);
+
+  // replace values in byte-array cache with modified data
+  // no changes made to flash, all in local byte-array cache
+  EEPROM.put(EEPROM_ADDR, eepromData);
+
+  // actually write the content of byte-array cache to
+  // hardware flash.  flash write occurs if and only if one or more byte
+  // in byte-array cache has been changed, but if so, ALL 512 bytes are 
+  // written to flash
+  if (EEPROM.commit()) {
+    Serial.println("EEPROM commit succeeded");
+  } else {
+    Serial.println("EEPROM commit FAILED");
+  }
+}
+
 void setup(void) {
   Serial.begin(115200);
   delay(10);
@@ -997,6 +1124,7 @@ void setup(void) {
   Serial.println(BOOT_MESSAGE);
   Serial.flush();
 
+  readEeprom();
   randomSeed(analogRead(0)); // seed with random noise for misc functions
 
   // Initialize SX1509 I/O expanders
@@ -1084,16 +1212,13 @@ void setup(void) {
   // Set up callbacks for client URIs
   server.on("/", handleRoot);
   server.onNotFound(handleNotFound);
-  server.on("/status", HTTP_GET, handleStatus);
+  //server.on("/status", HTTP_GET, handleStatus);
   // Start the HTTP server
   server.begin();
   Serial.println("HTTP server started");
   #endif
   
-  printCommandMenu();
-
   // Get initial port data via REST
-  Serial.println("Fetching initial port data...");
   getPortData(DEVICE_ID);
 
   #ifdef USE_FIREBASE
@@ -1116,6 +1241,8 @@ void setup(void) {
     Serial.println(firebaseData.errorReason());
   }
   #endif
+
+  printCommandMenu();
 }
 
 void loop(void) {
@@ -1155,7 +1282,7 @@ void loop(void) {
             && (ports[i].stats.pop_stdev() <= STD_DEV_THRESHOLD)
             && ((millis() - ports[i].lastWeightMeasurementPushMillis) >= WEIGHT_MEASURE_INTERVAL_MS))) {
         // Log it
-        printLogMessage(i, kg_change);
+        if (enableLogUpdates) printLogMessage(i, kg_change);
         // Send new weight_kg to Realtime Database via HTTP function
         if (setWeight(DEVICE_ID, i, ports[i].stats.average())) {
           // success
@@ -1174,10 +1301,6 @@ void loop(void) {
     if ((key == 'h') || (key == 'H') || (key == '?')) {
       printCommandMenu();
     }
-    // if (key == 't' || key == 'T') {
-    //   Serial.println("Resetting scales to 0...");
-    //   tare();
-    // }
     if (key == 'r' || key == 'R') {
       Serial.println("Rebooting device...");
       resetDisplay();
@@ -1188,19 +1311,29 @@ void loop(void) {
       Serial.print("Data logging is ");
       Serial.println(enableLogData ? "ON" : "OFF");
     }
-    if (key == 'w' || key == 'W') {
+    if (key == 's' || key == 'S') {
       enablePrintScaleData = !enablePrintScaleData;
       Serial.print("Scale data logging is ");
       Serial.println(enablePrintScaleData ? "ON" : "OFF");
     }
-    if (key == 's' || key == 'S') {
-      Serial.println("Synchronizing all LED outputs...");
-      syncLeds();
+    if (key == 'l' || key == 'L') {
+      enableLogUpdates = !enableLogUpdates;
+      Serial.print("Update logging is ");
+      Serial.println(enableLogUpdates ? "ON" : "OFF");
+    }
+    if (key == 'w' || key == 'W') {
+      writeEeprom();
     }
     if (key == 'd' || key == 'D') {
       Serial.println("Running display tests...");
       displayTest();
       Serial.println("...done.");
+    }
+    if ((key == 'o') || (key == 'O')) {
+      calibrateOffsets();
+    }
+    if ((key == 'f') || (key == 'F')) {
+      calibrateScaleFactor(slotSelected);
     }
     if (key == '0') {
       Serial.println("Restoring LED state...");
@@ -1242,12 +1375,19 @@ void loop(void) {
       Serial.println("Setting blue wave pattern...");
       ledWaveRight(0, 0, 1);
     }
+    if (key == '+') {
+      if (slotSelected < (PORT_COUNT - 1)) slotSelected++;
+      Serial.println("Slot " + String(slotSelected) + " is selected");
+    }
+    if (key == '-') {
+      if (slotSelected > 0) slotSelected--;
+      Serial.println("Slot " + String(slotSelected) + " is selected");
+    }
     if (key == 'x') {
       Serial.println("Clearing display...");
       for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
         setLedState(pos, LED_OFF);
       }
     }
-    
   }
 }
