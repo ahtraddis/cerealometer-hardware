@@ -4,20 +4,26 @@
  * Copyright (c) 2020 Eric Schwartz
  */
 
+/**
+ * TODO:
+ * Test with incorrect device_id (all green LEDs?)
+ */
+
 // Enable/disable options
 #define DEBUG false
-#define USE_FIREBASE
+//#define USE_FIREBASE_CALLBACK
 
 #define BOOT_MESSAGE "Cerealometer v0.1 Copyright (c) 2020 Eric Schwartz"
 
 // These non-essential features are disabled due to limited flash memory on the
 // SparkFun Thing Dev board. Uncomment to enable them if your hardware so allows!
 //#define ENABLE_MDNS
-//#define ENABLE_WEBSERVER
+#define ENABLE_WEBSERVER
 //#define USE_WIFI_MULTI
 
 // Local config file including URLs and credentials
 #include "config.h"
+#include "templates.h"
 
 // FirebaseESP8266.h must be included before ESP8266Wifi.h
 #include "FirebaseESP8266.h"
@@ -36,17 +42,13 @@
 #endif
 
 #include "HX711-multi.h"
-
 #include "Statistic.h"
-// [eschwartz-TODO] Commenting out (ok so far, probably included elsewhere)
-//#include <Wire.h> // Include the I2C library (required)
 #include <SparkFunSX1509.h>
 #include <jsonlib.h>
 #include <EEPROM.h>
 
 // Constants
 
-#define PORT_COUNT 6
 #define WEIGHT_MEASURE_INTERVAL_MS 500
 #define STATS_WINDOW_LENGTH 10
 #define PRESENCE_THRESHOLD_KG 0.001
@@ -61,6 +63,7 @@
 #define STATUS_LOADED 3
 #define STATUS_UNLOADED 4
 #define STATUS_CLEARING 5
+#define STATUS_CALIBRATING 6
 // LED states
 #define LED_OFF 0
 #define LED_INITIALIZING 1
@@ -68,26 +71,27 @@
 #define LED_LOADED 3
 #define LED_UNLOADED 4
 #define LED_CLEARING 5
-#define LED_RED 6
-#define LED_RED_BLINK 7
-#define LED_RED_BLINK_FAST 8
-#define LED_RED_BREATHE 9
-#define LED_GREEN 10
-#define LED_GREEN_BLINK 11
-#define LED_GREEN_BLINK_FAST 12
-#define LED_GREEN_BREATHE 13
-#define LED_BLUE 14
-#define LED_BLUE_BLINK 15
-#define LED_BLUE_BLINK_FAST 16
-#define LED_BLUE_BREATHE 17
-#define LED_WHITE 18
-#define LED_WHITE_BLINK 19
-#define LED_WHITE_BLINK_FAST 20
-#define LED_YELLOW 21
-#define LED_PURPLE 22
-#define LED_CYAN 23
+#define LED_CALIBRATING 6
+#define LED_RED 7
+#define LED_RED_BLINK 8
+#define LED_RED_BLINK_FAST 9
+#define LED_RED_BREATHE 10
+#define LED_GREEN 11
+#define LED_GREEN_BLINK 12
+#define LED_GREEN_BLINK_FAST 13
+#define LED_GREEN_BREATHE 14
+#define LED_BLUE 15
+#define LED_BLUE_BLINK 16
+#define LED_BLUE_BLINK_FAST 17
+#define LED_BLUE_BREATHE 18
+#define LED_WHITE 19
+#define LED_WHITE_BLINK 20
+#define LED_WHITE_BLINK_FAST 21
+#define LED_YELLOW 22
+#define LED_PURPLE 23
+#define LED_CYAN 24
 
-// LED control
+// LED control and timing
 #define COLOR_COUNT 3
 #define R 0
 #define G 1
@@ -121,18 +125,20 @@
 #define HX711_DT5 16 // GPIO16, XPD (can be used to wake from deep sleep)
 
 #define TARE_TIMEOUT_MS 2000 // less than ~3 secs to avoid tripping watchdog timer
-byte DATA_OUTS[6] = { HX711_DT0, HX711_DT1, HX711_DT2, HX711_DT3, HX711_DT4, HX711_DT5 };
-#define CHANNEL_COUNT sizeof(DATA_OUTS) / sizeof(byte)
-long int scale_results[CHANNEL_COUNT];
-HX711MULTI scales(CHANNEL_COUNT, DATA_OUTS, HX711_CLK);
+byte DATA_OUTS[] = { HX711_DT0, HX711_DT1, HX711_DT2, HX711_DT3, HX711_DT4, HX711_DT5 };
+#define PORT_COUNT sizeof(DATA_OUTS) / sizeof(byte)
+long int scale_results[PORT_COUNT];
+HX711MULTI scales(PORT_COUNT, DATA_OUTS, HX711_CLK);
+
+// Misc
+#define EEPROM_ADDR 0
+#define EEPROM_LEN 512
+#define WIFI_CONNECT_TIMEOUT_MS 8000
 
 // Macros
 #define MIN(a,b) (((a)<(b))?(a):(b))
 #define MAX(a,b) (((a)>(b))?(a):(b))
 #define LEN(arr) ((int) (sizeof(arr) / sizeof(arr)[0]))
-
-#define EEPROM_ADDR 0
-#define EEPROM_LEN 512
 
 // Globals
 
@@ -143,7 +149,7 @@ ESP8266WiFiMulti wifiMulti;
 // Create webserver object listening for HTTP requests on port 80
 ESP8266WebServer server(80);
 #endif
-#ifdef USE_FIREBASE
+#ifdef USE_FIREBASE_CALLBACK
 FirebaseData firebaseData;
 #endif
 
@@ -170,7 +176,7 @@ const int led_pins[PORT_COUNT][COLOR_COUNT][2] = {
 };
 
 // RGB color sequence used for display tests
-const static bool rgbSeq[][COLOR_COUNT] = {
+const static boolean rgbSeq[][COLOR_COUNT] = {
   { 1, 0, 0 }, // red
   { 0, 1, 0 }, // green
   { 0, 0, 1 }, // blue
@@ -180,27 +186,39 @@ const static bool rgbSeq[][COLOR_COUNT] = {
   { 0, 1, 1 }, // cyan
 };
 
-// Load cell offsets and calibration factors, retrieved from flash.
-// Tare offset corresponds to the HX711 value when load is zero.
-long int hx711_tare_offsets[PORT_COUNT] = {0};
-// Calibration factor is the linear conversion factor to scale value to kilograms.
-int hx711_calibration_factors[PORT_COUNT] = {0};
-
-char buff[10];
+char buff[10]; // for string formatting
+// Serial command states
 boolean enablePrintScaleData = false;
 boolean enableLogData = false;
 boolean enableLogUpdates = false;
 uint8_t slotSelected = 0;
 
+boolean rebootRequired = false;
+unsigned long rebootTimeMillis = 0;
+
+// Config and calibration data loaded from EEPROM (512 bytes max)
 typedef struct {
-  char device_id[30] = "";
-  char wifi_ssid[30] = "";
-  char wifi_password[30] = "";
+  char device_id[32] = "";
+  char wifi_ssid[64] = "";
+  char wifi_password[64] = "";
+  char firebase_project_id[64] = "";
+  char firebase_db_secret[64] = "";
   long offsets[PORT_COUNT] = {0};
   int calibration_factors[PORT_COUNT] = {0};
 } EepromData;
 
 EepromData eepromData;
+
+char* device_id = "";
+char* wifi_ssid = "";
+char* wifi_password = "";
+char* firebase_project_id = "";
+char* firebase_db_secret = "";
+// Load cell offsets and calibration factors.
+// Tare offset corresponds to the HX711 value with no load present.
+long int hx711_tare_offsets[PORT_COUNT] = {0};
+// Calibration factor is the linear conversion factor to scale value to kilograms.
+int hx711_calibration_factors[PORT_COUNT] = {0};
 
 typedef struct {
   int calibration_factor;
@@ -216,28 +234,31 @@ typedef struct {
 Port ports[PORT_COUNT];
 byte currentLedStates[PORT_COUNT];
 
-#ifdef ENABLE_WEBSERVER
-void handleRoot();
-void handleNotFound();
-#endif
-
-// declare board reset function at address 0
-void(* resetDevice) (void) = 0;
-
+// Function prototypes
 void ledBreatheRow(uint8_t colorIndex=0, byte onIntensity=255, int delayMs=0, int delayStepMs=1);
 void ledFadeUpRow(boolean r=0, boolean g=0, boolean b=0, byte onIntensity=255, int delayMs=0, int delayStepMs=1);
 void ledFadeDownRow(boolean r=0, boolean g=0, boolean b=0, byte onIntensity=255, int delayMs=0, int delayStepMs=1);
 void ledWaveRight(boolean r=0, boolean g=0, boolean b=0, int delayMs=100);
 void ledRandom(int maxCount=1, int delayMs=0, int delayStepMs=1);
 void setLedState(uint8_t pos, uint8_t state=LED_OFF, boolean sync=true);
+void setAllLedStates(uint8_t state=LED_OFF, boolean sync=true);
 void ledCylon(int count=10, int delayMs=150);
 void getAverageScaleData(long *result, byte times=10);
+#ifdef ENABLE_WEBSERVER
+void handleRoot();
+void handleSettings();
+void handleCalibrate();
+void handleUtil();
+void handleLoading();
+#endif
 
 // Global functions
 
 int getPortData(String device_id) {
   Serial.print("Fetching initial port data...");
-  http.begin(REST_API_BASEURL + String("/getDevice?device_id=") + device_id);
+  String url = REST_API_BASEURL_PATTERN;
+  url.replace("%%FIREBASE_PROJECT_ID%%", firebase_project_id);
+  http.begin(url + String("/getDevice?device_id=") + device_id);
   http.addHeader("Content-Type", "application/json");
   int httpCode = http.GET();
   if (httpCode == HTTP_CODE_OK) {
@@ -269,8 +290,10 @@ int getPortData(String device_id) {
 
 int setWeight(String device_id, int slot, float weight_kg) {
   // Open https connection to setWeight cloud function
-  // [eschwartz-TODO] Re-test with https, import SHA1_FINGERPRINT from config and add as 2nd param
-  http.begin(REST_API_BASEURL + String("/setWeight"));
+  String url = REST_API_BASEURL_PATTERN;
+  url.replace("%%FIREBASE_PROJECT_ID%%", firebase_project_id);
+  // [eschwartz-TODO] Re-test with https, import SHA1_FINGERPRINT from config (2nd param):
+  http.begin(url + String("/setWeight"));
   http.addHeader("Content-Type", "application/json");
   String data = String("{\"device_id\": \"") + device_id
     + String("\", \"slot\": \"") + String(slot)
@@ -287,8 +310,6 @@ int setWeight(String device_id, int slot, float weight_kg) {
       Serial.print(slot);
       Serial.print(" setWeight SUCCESS, httpCode = ");
       Serial.println(httpCode);
-      //Serial.print("response: ");
-      //Serial.println(payload);
     }
   } else {
     Serial.print("Slot ");
@@ -301,7 +322,8 @@ int setWeight(String device_id, int slot, float weight_kg) {
   http.end();
 }
 
-void printCurrentValues(void) {
+void printCurrentValues() {
+  Serial.print("Weights (kg): ");
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
     Serial.print(ports[i].current_weight_kilograms, 4);
     Serial.print((i != PORT_COUNT - 1) ? "\t" : "\n");
@@ -331,17 +353,19 @@ void printLogMessage(uint8_t slot, float kg_change) {
 }
 
 // Restore LED states after disrupting them with tests
-void restoreLedStates(void) {
+void restoreLedStates() {
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
     setLedState(i, statusToLedState(ports[i].status));
   }
 }
 
 // Run LED test sequences
-void displayTest(void) {
+void displayTest() {
   int delayMs = 0;
   int delayStepMs = 1;
   byte onIntensity = 255;
+
+  Serial.println("Running display tests...");
   resetDisplay();
   ledCylon(5);
   delay(1000);
@@ -366,6 +390,7 @@ void displayTest(void) {
   resetDisplay();
   delay(1000);
   restoreLedStates();
+  Serial.println("...done.");
 }
 
 void resetDisplay() {
@@ -483,11 +508,19 @@ void ledCylon(int count, int delayMs) {
   }
 }
 
+void setAllLedStates(uint8_t state, boolean sync) {
+  for (uint8_t i = 0; i < PORT_COUNT; i++) {
+    setLedState(i, state, sync);
+  }
+}
+
 // Set LED state
 // To stop blink:
 // io[device].setupBlink(pin, 0, 0, 255);
 // See https://forum.sparkfun.com/viewtopic.php?t=48433)
 // Notes:
+// State changes are a bit messy due to limitations on turning OFF blink
+// and breathe via the SX1509.
 // To stop a pin that is "breathing", do a digitalWrite() of HIGH to enter single-shot mode.
 void setLedState(uint8_t pos, uint8_t state, boolean sync) {
   if (state == currentLedStates[pos]) return; // already set
@@ -633,6 +666,7 @@ void setLedState(uint8_t pos, uint8_t state, boolean sync) {
       io[device].setupBlink(pin, 0, 0, 255); // stop blink
       break;
     case LED_BLUE:
+    case LED_CALIBRATING:
       // red
       device = led_pins[pos][R][DEV];
       pin = led_pins[pos][R][PIN];
@@ -644,8 +678,8 @@ void setLedState(uint8_t pos, uint8_t state, boolean sync) {
       io[device].digitalWrite(pin, HIGH); // stop breathe
       io[device].setupBlink(pin, 0, 0, 255); // stop blink
       // blue
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
+      device = led_pins[pos][B][DEV];
+      pin = led_pins[pos][B][PIN];
       io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
       break;
     case LED_BLUE_BLINK:
@@ -782,6 +816,8 @@ byte statusToLedState(byte status) {
     case STATUS_INITIALIZING:
       val = LED_INITIALIZING;
       break;
+    case STATUS_CALIBRATING:
+      val = LED_CALIBRATING;
     default:
       val = STATUS_UNKNOWN;
       break;
@@ -809,6 +845,34 @@ byte statusStringToInt(String status) {
   return val;
 }
 
+String statusToString(byte status) {
+  String str;
+  switch (status) {
+    case STATUS_UNKNOWN:
+      str = "UNKNOWN";
+      break;
+    case STATUS_VACANT:
+      str = "VACANT";
+      break;
+    case STATUS_LOADED:
+      str = "LOADED";
+      break;
+    case STATUS_UNLOADED:
+      str = "UNLOADED";
+      break;
+    case STATUS_CLEARING:
+      str = "CLEARING";
+      break;
+    case STATUS_INITIALIZING:
+      str = "INITIALIZING";
+      break;
+    default:
+      str = "UNKNOWN";
+      break;
+  }
+  return str;
+}
+
 void streamCallback(StreamData data) {
   if (DEBUG) {
     Serial.println("___________ Stream callback data received __________");
@@ -833,8 +897,7 @@ void streamCallback(StreamData data) {
   else if (data.dataType() == "string") {
     if (DEBUG) Serial.println(data.stringData());
     if (data.dataPath().startsWith("/data/") && data.dataPath().endsWith("/status")) {
-      // matched "/data/n/status"
-      // update slot status and LED state
+      // Matched "/data/n/status", update slot status and LED state
       // [eschwartz-TODO] This assumes single digit slot number. Change to allow multi digit.
       uint8_t slot = data.dataPath().substring(6, 7).toInt();
       if ((slot >= 0) && (slot < PORT_COUNT)) {
@@ -847,7 +910,9 @@ void streamCallback(StreamData data) {
   else if (data.dataType() == "json") {
     // [eschwartz-TODO] Parse this and set status for each port upon startup
     // (it gets invoked when callback is set)
-    if (DEBUG) Serial.println(data.jsonString());
+    Serial.println("INITIAL JSON:");
+    Serial.println(data.jsonString());
+    //if (DEBUG) Serial.println(data.jsonString());
   }
   else if (data.dataType() == "array") {
     if (DEBUG) Serial.println("got dataType() 'array'");
@@ -856,8 +921,9 @@ void streamCallback(StreamData data) {
     // something was deleted
     if (data.dataPath().startsWith("/data/") && !data.dataPath().endsWith("/status")) {
       // matched "/data/n" (if dataType is 'null', port was deleted)
+      // [eschwartz-TODO] This assumes single digit slot number. Change to allow multi digit.
       uint8_t slot = data.dataPath().substring(6, 7).toInt();
-      if ((slot >= 0) && (slot <= PORT_COUNT)) {
+      if ((slot >= 0) && (slot < PORT_COUNT)) {
         ports[slot].status = STATUS_UNKNOWN;
         setLedState(slot, statusToLedState(STATUS_UNKNOWN));
       }
@@ -865,7 +931,7 @@ void streamCallback(StreamData data) {
   }
 }
 
-void streamTimeoutCallback(bool timeout) {
+void streamTimeoutCallback(boolean timeout) {
   if (timeout) {
     // Stream timeout occurred
     //if (DEBUG) Serial.println("Stream timeout, resuming...");
@@ -873,112 +939,231 @@ void streamTimeoutCallback(bool timeout) {
 }
 
 #ifdef ENABLE_WEBSERVER
-void handleRoot() {
-  displayHtml();
+
+String styleHtml() {
+  String html = styleHtmlTemplate;
+  return html;
 }
 
-// Send HTTP status 404 (Not Found) when there's no handler for the URI in the request
-void handleNotFound() {
- String message = "404: Not found\n\n";
- message += "URI: ";
- message += server.uri();
- message += "\nMethod: ";
- message += (server.method() == HTTP_GET) ? "GET" : "POST";
- message += "\nArguments: ";
- message += server.args();
- message += "\n";
- for (uint8_t i = 0; i < server.args(); i++) {
-   message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
- }
- server.send(404, "text/plain", message);
+String scriptHtml() {
+  String html = scriptHtmlTemplate;
+  return html;
 }
 
-String getDataSummaryHtml(void) {
-  String output = "<table><tr><th>Slot</th><th>Weight (kg)</th><th>Calibration factor</th><th>Status</th></tr>";
+String headerHtml() {
+  String html = headerHtmlTemplate;
+  html.replace("{STYLE}", styleHtml());
+  html.replace("{SCRIPT}", scriptHtml());
+  return html;
+}
+
+String footerHtml() {
+  String html = footerHtmlTemplate;
+  return html;
+}
+
+String settingsHtml() {
+  String html = settingsHtmlTemplate;
+  html.replace("{DEVICE_ID}", device_id);
+  html.replace("{WIFI_SSID}", wifi_ssid);
+  html.replace("{WIFI_PASSWORD}", wifi_password);
+  html.replace("{FIREBASE_PROJECT_ID}", firebase_project_id);
+  html.replace("{FIREBASE_DB_SECRET}", firebase_db_secret);
+  return html;
+}
+
+String calibrateHtml() {
+  String html = calibrateHtmlTemplate;
+  String tableRowsHtml = "";
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
-    output += "<tr><th>" + String(i) + "</th>";
-    output += "<td>" + String(dtostrf(ports[i].last_weight_kilograms, 2, 4, buff)) + "</td>";
-    output += "<td>" + String(ports[i].calibration_factor) + "</td>";
-    output += "<td>" + String(ports[i].status) + "</td>";
-    output += "</tr>";
+    String rowHtml = calibrateRowHtmlTemplate;
+    rowHtml.replace("{PORT}", String(i + 1));
+    rowHtml.replace("{LAST_WEIGHT_KILOGRAMS}", String(dtostrf(ports[i].last_weight_kilograms, 2, 4, buff)));
+    rowHtml.replace("{TARE_OFFSET}", String(hx711_tare_offsets[i]));
+    rowHtml.replace("{CALIBRATION_FACTOR}", String(hx711_calibration_factors[i]));
+    rowHtml.replace("{STATUS}", statusToString(ports[i].status));
+    tableRowsHtml += rowHtml;
   }
-  output += "</table>";
-  return output;
+  html.replace("{TABLE_ROWS}", tableRowsHtml);
+    
+  return html;
 }
 
-void displayHtml() {
-  String output = "";
-  // Display the HTML web page
-  // Send HTTP status 200 (Ok) and send some text to the browser/client
-  output += "<!DOCTYPE html><html>";
-  output += "<head><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">";
-  output += "<link rel=\"icon\" href=\"data:,\">";
-  output += "<style>";
-  output += "html { font-family: Helvetica; display: inline-block; margin: 0px auto;}";
-  output += ".button { background-color: #195B6A; border: none; color: white; padding: 16px 40px;";
-  output += "text-decoration: none; font-size: 30px; margin: 2px; cursor: pointer;}";
-  output += "</style></head>";
-  
-  // [eschwartz-TODO] Add controls:
-  // Pause/Resume sending
-  // Reboot
-  // Date/time
-
-  // Web Page Heading
-  output += "<body><h1>Cerealometer</h1>";
-  output += "<p><a href=\"/\">Home</a></p>";
-  output += "<h2>Configuration</h2>";
-  output += "<p>Connected to: " + String(WiFi.SSID()) + "</p>";
-  output += "<p>DEVICE_ID: " + String(DEVICE_ID) + "</p>";
-  output += "<p>PORT_COUNT: " + String(PORT_COUNT) + "</p>";
-  // output += "<p>IP address: ";
-  // output +=  String(WiFi.localIP());
-  // output += "</p>";
-  output += "<p>REST_API_BASEURL: " + String(REST_API_BASEURL) + "</p>";
-  output += "<p>WEIGHT_MEASURE_INTERVAL_MS: " + String(WEIGHT_MEASURE_INTERVAL_MS) + "</p>";
-  output += "<p>STATS_WINDOW_LENGTH: " + String(STATS_WINDOW_LENGTH) + "</p>";
-  output += "<p>PRESENCE_THRESHOLD_KG: " + String(PRESENCE_THRESHOLD_KG, 4) + "</p>";
-  output += "<p>KG_CHANGE_THRESHOLD: " + String(KG_CHANGE_THRESHOLD, 4) + "</p>";
-  output += "<p>STD_DEV_THRESHOLD: " + String(STD_DEV_THRESHOLD, 4) + "</p>";
-  output += "<h2>Data</h2>";
-  output += getDataSummaryHtml();
-  output += "</body></html>";
-  
-  server.send(200, "text/html", output);
+String utilHtml() {
+  String html = utilHtmlTemplate;
+  return html;
 }
+
+String loadingHtml() {
+  String html = loadingHtmlTemplate;
+  html.replace("{STYLE}", styleHtml());
+  // [eschwartz-TODO] Not sure why but these URLs are breaking the raw string when inserted in the template
+  html.replace("{URL1}", "https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.min.js");
+  html.replace("{URL2}", "https://loading.io/mod/spinner/spinner/index.svg");
+  return html;
+}
+
+void handleRoot() {
+  // consider /settings the root
+  server.sendHeader("Location", "/settings");
+  server.send(302);
+}
+
+void handleSettings() {
+  if (server.method() == HTTP_GET) {
+    server.send(200, "text/html", headerHtml() + settingsHtml() + footerHtml());
+  }
+  else if (server.method() == HTTP_POST) {
+    boolean updateRequired = false;
+    // [eschwartz-TODO] Validate all inputs
+    if (server.hasArg("device_id")) {
+      String str_device_id = server.arg("device_id");
+      if (str_device_id.length() > 0 && str_device_id.length() < 32) {
+        Serial.println("Updating device ID...");
+        strcpy(device_id, str_device_id.c_str());
+        updateRequired = true;
+      }
+    }
+    if (server.hasArg("firebase_project_id")) {
+      String str_firebase_project_id = server.arg("firebase_project_id");
+      if (str_firebase_project_id.length() > 0 && str_firebase_project_id.length() < 64) {
+        Serial.println("Updating Firebase project ID...");
+        strcpy(firebase_project_id, str_firebase_project_id.c_str());
+        updateRequired = true;
+      }
+    }
+    if (server.hasArg("firebase_db_secret")) {
+      String str_firebase_db_secret = server.arg("firebase_db_secret");
+      if (str_firebase_db_secret.length() > 0 && str_firebase_db_secret.length() < 64) {
+        Serial.println("Updating Firebase database secret...");
+        strcpy(firebase_db_secret, str_firebase_db_secret.c_str());
+        updateRequired = true;
+      }
+    }
+    if (server.hasArg("wifi_ssid")) {
+      String str_wifi_ssid = server.arg("wifi_ssid");
+      if (str_wifi_ssid.length() > 0 && str_wifi_ssid.length() < 32) {
+        Serial.println("Updating WiFi SSID...");
+        strcpy(wifi_ssid, str_wifi_ssid.c_str());
+        updateRequired = true;
+      }
+    }
+    if (server.hasArg("wifi_password")) {
+      String str_wifi_password = server.arg("wifi_password");
+      if (str_wifi_password.length() > 0 && str_wifi_password.length() < 32) {
+        Serial.println("Updating WiFi password...");
+        strcpy(wifi_password, str_wifi_password.c_str());
+        updateRequired = true;
+      }
+    }
+
+    // Redirect to loading page for reboot
+    server.sendHeader("Location", "/loading");
+    server.send(303);
+    
+    if (updateRequired) {
+      writeEeprom();
+      // Schedule reboot via loop() so this handler can exit
+      rebootRequired = true;
+      rebootTimeMillis = millis() + 2000;
+    }
+  } else {
+    server.send(405, "text/html", "Method Not Allowed");
+  }
+}
+
+void handleCalibrate() {
+  if (server.method() == HTTP_GET) {
+    server.send(200, "text/html", headerHtml() + calibrateHtml() + footerHtml());
+  }
+  else if (server.method() == HTTP_POST) {
+    if (server.hasArg("id")) {
+      // Calibrate button clicked
+      int factor = calibrateScaleFactor(server.arg("id").toInt());
+      server.send(200, "text/html", String(factor));
+    }
+    if (server.hasArg("offsets")) {
+      // Tare Scales button clicked 
+      calibrateOffsets();
+      server.sendHeader("Location", "/loading");
+      server.send(303);
+      // Schedule reboot via loop() so this handler can exit
+      rebootRequired = true;
+      rebootTimeMillis = millis() + 2000;
+    }
+  }
+  else {
+    server.send(405, "text/html", "Method Not Allowed");
+  }
+}
+
+void handleUtil() {
+  if (server.method() == HTTP_GET) {
+    server.send(200, "text/html", headerHtml() + utilHtml() + footerHtml());
+  }
+  else if (server.method() == HTTP_POST) {
+    if (server.hasArg("reboot")) {
+      // Reboot button clicked, redirect to loading page
+      server.sendHeader("Location", "/loading");
+      server.send(303);
+      // Schedule reboot via loop() so this handler can exit
+      rebootRequired = true;
+      rebootTimeMillis = millis() + 2000;
+    }
+    if (server.hasArg("displaytest")) {
+      // Run Display Tests button clicked, redirect to self
+      server.sendHeader("Location", "/util");
+      server.send(303);
+      displayTest();
+    }
+  }
+  else {
+    server.send(405, "text/html", "Method Not Allowed");
+  }
+}
+
+void handleLoading() {
+  server.send(200, "text/html", loadingHtml());
+}
+// end of #ifdef ENABLE_WEBSERVER
 #endif
 
-void printCommandMenu() {
+void printSerialCommandMenu() {
   Serial.println("COMMANDS:");
-  Serial.println("[H] Help [R] Reboot [D] Display tests [W] Write EEPROM");
-  Serial.println("[S] Toggle scale data log [P] Toggle port data log [L] Toggle update log");
-  Serial.println("[0] Restore LED state [1] Blink reds [2] Blink greens [3] Blink blues");
-  Serial.println("[4] Whites on [5] Wave red [6] Wave green [7] Wave blue");
+  Serial.println("[H] Help menu [R] Reboot [D] Display tests [W] Write EEPROM");
+  Serial.println("[L] Toggle update log [S] Toggle scale data log [P] Toggle port data log");
+  Serial.println("[0] Restore LED state [1] Blink red [2] Blink green [3] Blink blue");
+  Serial.println("[4] White on [5] Wave red [6] Wave green [7] Wave blue");
   Serial.println("[O] Calib offsets [+] Select slot (+) [-] Select slot (-) [F] Calib slot " + String(slotSelected));
-  Serial.println("Debugging: eepromData (use W to commit changes):");
+  Serial.println("TEMP DEBUG OUTPUT: eepromData (use W to commit changes):");
   printEepromData();
 }
 
 void calibrateOffsets() {
   long int results[PORT_COUNT] = {0};
+  uint8_t i;
   Serial.println("Calibrating offsets: sampling averages...");
+  setAllLedStates(LED_CALIBRATING);
   getAverageScaleData(results, 10);
-  for (uint8_t i = 0; i < PORT_COUNT; i++) {
+  for (i = 0; i < PORT_COUNT; i++) {
     hx711_tare_offsets[i] = results[i];
     // stage data for writing
     eepromData.offsets[i] = results[i];
   }
+  writeEeprom();
+  restoreLedStates();
 }
 
-void calibrateScaleFactor(uint8_t slot) {
+int calibrateScaleFactor(uint8_t slot) {
   long int results[PORT_COUNT] = {0};
   Serial.println("Calibrating scale factor for Slot " + String(slot));
+  setLedState(slot, LED_CALIBRATING);
   getAverageScaleData(results, 10);
+  restoreLedStates();
   hx711_calibration_factors[slot] = 1.0 * (results[slot] - hx711_tare_offsets[slot]) / CALIBRATION_WEIGHT_KG;
-  for (uint8_t i = 0; i < PORT_COUNT; i++) {
-    // stage data for writing
-    eepromData.calibration_factors[i] = hx711_calibration_factors[i];
-  }
+  // stage EEPROM data for writing
+  eepromData.calibration_factors[slot] = hx711_calibration_factors[slot];
+  return hx711_calibration_factors[slot];
 }
 
 void getAverageScaleData(long *result, byte times) {
@@ -989,7 +1174,6 @@ void getAverageScaleData(long *result, byte times) {
   for (i = 0; i < scales.get_count(); i++) {
     calStats[i].clear();
   }
-
   for (count = 0; count < times; count++) {
     scales.read(values);
     for (i = 0; i < scales.get_count(); i++) {
@@ -1022,9 +1206,8 @@ void printScaleData() {
   scales.read(scale_results);
   for (uint8_t i = 0; i < scales.get_count(); ++i) {
     Serial.print(scale_results[i]);
-    Serial.print("\t (");
+    Serial.print("\t");
     Serial.print(1.0 * (scale_results[i] - hx711_tare_offsets[i]) / hx711_calibration_factors[i], 4);
-    Serial.print(")");
     Serial.print((i != scales.get_count() - 1) ? "\t" : "\n");
   }
 }
@@ -1043,7 +1226,7 @@ void syncLeds() {
   for (uint8_t i = 0; i < SX1509_COUNT; i++) {
     regMisc = io[i].readByte(REG_MISC);
     if (!(regMisc & 0x04)) {
-      regMisc |= (1<<2);
+      regMisc |= (1 << 2);
       io[i].writeByte(REG_MISC, regMisc);
     }
   }
@@ -1058,14 +1241,16 @@ void syncLeds() {
 	// Return nReset to POR functionality on each SX1509
   for (uint8_t i = 0; i < SX1509_COUNT; i++) {
     regMisc = io[i].readByte(REG_MISC);
-    io[i].writeByte(REG_MISC, (regMisc & ~(1<<2)));
+    io[i].writeByte(REG_MISC, (regMisc & ~(1 << 2)));
   }
 }
 
 void printEepromData() {
-  Serial.println("device_id:     '" + String(eepromData.device_id) + "'");
-  Serial.println("wifi_ssid:     '" + String(eepromData.wifi_ssid) + "'");
-  Serial.println("wifi_password: '" + String(eepromData.wifi_password) + "'");
+  Serial.println("device_id:           '" + String(eepromData.device_id) + "'");
+  Serial.println("wifi_ssid:           '" + String(eepromData.wifi_ssid) + "'");
+  Serial.println("wifi_password:       '" + String(eepromData.wifi_password) + "'");
+  Serial.println("firebase_project_id: '" + String(eepromData.firebase_project_id) + "'");
+  Serial.println("firebase_db_secret:  '" + String(eepromData.firebase_db_secret) + "'");
   Serial.println("Slot\tOffset\tCal factor");
   Serial.println("----\t------\t----------");
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
@@ -1083,6 +1268,11 @@ void readEeprom() {
   EEPROM.begin(EEPROM_LEN);
   EEPROM.get(EEPROM_ADDR, eepromData);
   printEepromData();
+  device_id = eepromData.device_id;
+  wifi_ssid = eepromData.wifi_ssid;
+  wifi_password = eepromData.wifi_password;
+  firebase_project_id = eepromData.firebase_project_id;
+  firebase_db_secret = eepromData.firebase_db_secret;
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
     hx711_tare_offsets[i] = eepromData.offsets[i];
     hx711_calibration_factors[i] = eepromData.calibration_factors[i];
@@ -1090,34 +1280,95 @@ void readEeprom() {
 }
 
 void writeEeprom() {
-  Serial.print("Writing EEPROM data to addr 0x");
-  Serial.println(EEPROM_ADDR, HEX);
-  // copy hardcoded config.h data for now
-  strncpy(eepromData.device_id, DEVICE_ID, 30);
-  strncpy(eepromData.wifi_ssid, WIFI_NETWORKS[0][0], 30);
-  strncpy(eepromData.wifi_password, WIFI_NETWORKS[0][1], 30);
-  printEepromData();
-  // commit EEPROM_LEN bytes of ESP8266 flash (for "EEPROM" emulation)
-  // this step actually loads the content (EEPROM_LEN bytes) of flash into 
-  // a EEPROM_LEN-byte-array cache in RAM
-  EEPROM.begin(EEPROM_LEN);
+  Serial.print("Writing EEPROM data to addr 0x" + String(EEPROM_ADDR, HEX));
+  Serial.println("...");
+  strncpy(eepromData.device_id, device_id, 32);
+  strncpy(eepromData.wifi_ssid, wifi_ssid, 64);
+  strncpy(eepromData.wifi_password, wifi_password, 64);
+  strncpy(eepromData.firebase_project_id, firebase_project_id, 64);
+  strncpy(eepromData.firebase_db_secret, firebase_db_secret, 64);
 
+  printEepromData();
+  // commit 512 bytes (EEPROM_LEN) of ESP8266 flash (for "EEPROM" emulation)
+  // this step actually loads the content (512 bytes) of flash into 
+  // a 512-byte-array cache in RAM
+  EEPROM.begin(EEPROM_LEN);
   // replace values in byte-array cache with modified data
   // no changes made to flash, all in local byte-array cache
   EEPROM.put(EEPROM_ADDR, eepromData);
-
   // actually write the content of byte-array cache to
   // hardware flash.  flash write occurs if and only if one or more byte
   // in byte-array cache has been changed, but if so, ALL 512 bytes are 
   // written to flash
   if (EEPROM.commit()) {
-    Serial.println("EEPROM commit succeeded");
+    Serial.println("commit succeeded.");
   } else {
-    Serial.println("EEPROM commit FAILED");
+    Serial.println("commit FAILED.");
   }
 }
 
-void setup(void) {
+void setupAP() {
+  Serial.print("SoftAP IP address: ");
+  Serial.println(WiFi.softAPIP());
+  Serial.print("Setting up access point with SSID '" + String(WIFI_AP_SSID) + "'...");
+  boolean result = WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD);
+  if (result) {
+    Serial.println("success.");
+  } else {
+    Serial.println("FAILED.");
+  }
+}
+
+boolean wifiConnect() {
+  unsigned long connectingMillis = millis();
+  // [eschwartz-TODO] Add LED error state upon failure
+  WiFi.begin(wifi_ssid, wifi_password);
+  while ((millis() - connectingMillis) < WIFI_CONNECT_TIMEOUT_MS) {
+    if (WiFi.status() == WL_CONNECTED) {
+      return true;
+    }
+    delay(500);
+    Serial.print('.');
+  }
+  // connect timed out
+  return false;
+}
+
+/**
+ * Subscribe to Firebase Realtime Database stream callbacks on /ports/<device_id>.
+ * This is needed to be able to update in realtime to slot status changes
+ * driven by the app or cloud functions.
+ */
+#ifdef USE_FIREBASE_CALLBACK
+void setupFirebaseCallback() {
+  String url = FIREBASE_HOST_PATTERN;
+  url.replace("%%FIREBASE_PROJECT_ID%%", firebase_project_id);
+  Firebase.begin(url, firebase_db_secret);
+  Firebase.reconnectWiFi(true);
+  // Set the size of WiFi RX/TX buffers
+  //firebaseData.setBSSLBufferSize(1024, 1024);
+  // Set the size of HTTP response buffers
+  //firebaseData.setResponseSize(1024);
+  // Set database read timeout to 1 minute (max 15 minutes)
+  //Firebase.setReadTimeout(firebaseData, 1000 * 60);
+  // Set write size limit and timeout: tiny (1s), small (10s), medium (30s), large (60s), or unlimited
+  //Firebase.setwriteSizeLimit(firebaseData, "tiny");
+  Firebase.setStreamCallback(firebaseData, streamCallback, streamTimeoutCallback);
+
+  String path = "/ports/" + String(device_id);
+  if (!Firebase.beginStream(firebaseData, path)) {
+    // unable to begin stream connection
+    Serial.println(firebaseData.errorReason());
+  }
+}
+#endif
+
+void reboot() {
+  resetDisplay();
+  ESP.restart();
+}
+
+void setup() {
   Serial.begin(115200);
   delay(10);
   Serial.println('\n');
@@ -1129,19 +1380,17 @@ void setup(void) {
 
   // Initialize SX1509 I/O expanders
   for (uint8_t i = 0; i < SX1509_COUNT; i++) {
-    Serial.print("Initializing SX1509 device ");
-    Serial.print(i);
-    Serial.print(" at address 0x");
+    Serial.print("Initializing SX1509 device " + String(i) + " at address 0x");
     Serial.print(SX1509_I2C_ADDRESSES[i], HEX);
     Serial.print("...");
     if (!io[i].begin(SX1509_I2C_ADDRESSES[i])) {
-      Serial.println(" FAILED");
+      Serial.println(" FAILED.");
       // [eschwartz-TODO] Set flag to skip I/O stuff or light an error LED
     } else {
-      Serial.println(" success");
+      Serial.println(" success.");
     }
   }
-  // Set output freq.: 0x0: 0Hz (low), 0xF: 2MHz? (high),
+  // Set output frequency: 0x0: 0Hz (low), 0xF: 2MHz? (high),
   // 0x1-0xE: fOSCout = Fosc / 2 ^ (outputFreq - 1) Hz
   byte outputFreq = 0xF;
   io[0].clock(INTERNAL_CLOCK_2MHZ, 2, OUTPUT, outputFreq);
@@ -1174,31 +1423,17 @@ void setup(void) {
     ports[i].stats.clear();
   }
 
+  Serial.print("SoftAP IP address: ");
+  Serial.println(WiFi.softAPIP());
   Serial.print("Connecting to WiFi...");
-  // [eschwartz-TODO] Add timeout and LED error state upon failure
-  #ifdef USE_WIFI_MULTI
-  // Add one for each network to connect to
-  for (uint8_t i = 0; i < LEN(WIFI_NETWORKS); i++) {
-    wifiMulti.addAP(WIFI_NETWORKS[i][0], WIFI_NETWORKS[i][1]);
+  if (wifiConnect()) {
+    Serial.print("\nConnected to " + WiFi.SSID());
+    Serial.print("IP address: " + WiFi.localIP());
+  } else {
+    Serial.println("connection timed out, setting up access point...");
+    setupAP();
   }
-  // Wait for WiFi connection; connect to strongest listed above
-  while (wifiMulti.run() != WL_CONNECTED) {
-    delay(250);
-    Serial.print('.');
-  }
-  #endif
-  #ifndef USE_WIFI_MULTI
-  WiFi.begin(WIFI_NETWORKS[0][0], WIFI_NETWORKS[0][1]);
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(250);
-    Serial.print('.');
-  }
-  #endif
   
-  Serial.print("\nConnected to ");
-  Serial.println(WiFi.SSID());
-  Serial.print("IP address: ");
-  Serial.println(WiFi.localIP());
   #ifdef MDNS
   // Start the mDNS responder for esp8266.local
   if (MDNS.begin("esp8266")) {
@@ -1211,41 +1446,29 @@ void setup(void) {
   #ifdef ENABLE_WEBSERVER
   // Set up callbacks for client URIs
   server.on("/", handleRoot);
-  server.onNotFound(handleNotFound);
-  //server.on("/status", HTTP_GET, handleStatus);
+  server.on("/settings", handleSettings);
+  server.on("/calib", handleCalibrate);
+  server.on("/util", handleUtil);
+  server.on("/loading", handleLoading);
+  server.onNotFound(handleRoot);
   // Start the HTTP server
   server.begin();
   Serial.println("HTTP server started");
   #endif
   
-  // Get initial port data via REST
-  getPortData(DEVICE_ID);
-
-  #ifdef USE_FIREBASE
-  Firebase.begin(FIREBASE_HOST, FIREBASE_AUTH);
-  Firebase.reconnectWiFi(true);
-  // Set the size of WiFi RX/TX buffers
-  //firebaseData.setBSSLBufferSize(1024, 1024);
-  // Set the size of HTTP response buffers
-  //firebaseData.setResponseSize(1024);
-  // Set database read timeout to 1 minute (max 15 minutes)
-  //Firebase.setReadTimeout(firebaseData, 1000 * 60);
-  // Set write size limit and timeout: tiny (1s), small (10s), medium (30s), large (60s), or unlimited
-  //Firebase.setwriteSizeLimit(firebaseData, "tiny");
-
-  String path = "/ports/" + String(DEVICE_ID);
-  Firebase.setStreamCallback(firebaseData, streamCallback, streamTimeoutCallback);
-
-  if (!Firebase.beginStream(firebaseData, path)) {
-    // unable to begin stream connection
-    Serial.println(firebaseData.errorReason());
+  // Get initial port data via REST call to Firebase
+  if (WiFi.status() == WL_CONNECTED) {
+    getPortData(device_id);
   }
+
+  #ifdef USE_FIREBASE_CALLBACK
+  setupFirebaseCallback();
   #endif
 
-  printCommandMenu();
+  printSerialCommandMenu();
 }
 
-void loop(void) {
+void loop() {
   #ifdef ENABLE_WEBSERVER
   // Listen for HTTP requests from clients
   server.handleClient();
@@ -1257,7 +1480,7 @@ void loop(void) {
 
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
     float kg_change = 0;
-    // Get current weight reading (signed integer), apply offset and calibratation factor
+    // Get current weight reading, apply offset and calibratation factor
     float weight_kilograms = MAX(1.0 * (scale_results[i] - hx711_tare_offsets[i]) / hx711_calibration_factors[i], 0);
     // Add current reading to stats arrays
     ports[i].stats.add(weight_kilograms);
@@ -1283,11 +1506,15 @@ void loop(void) {
             && ((millis() - ports[i].lastWeightMeasurementPushMillis) >= WEIGHT_MEASURE_INTERVAL_MS))) {
         // Log it
         if (enableLogUpdates) printLogMessage(i, kg_change);
-        // Send new weight_kg to Realtime Database via HTTP function
-        if (setWeight(DEVICE_ID, i, ports[i].stats.average())) {
-          // success
-          ports[i].last_weight_kilograms = ports[i].stats.average();
-          ports[i].lastWeightMeasurementPushMillis = millis();
+        if (WiFi.status() == WL_CONNECTED) {
+          // Send new weight_kg to Realtime Database via HTTP function
+          if (setWeight(device_id, i, ports[i].stats.average())) {
+            // success
+            ports[i].last_weight_kilograms = ports[i].stats.average();
+            ports[i].lastWeightMeasurementPushMillis = millis();
+          }
+        } else {
+          Serial.println("No WiFi connection, skipping update");
         }
         // Reset LED based on current port status
         setLedState(i, statusToLedState(ports[i].status));
@@ -1299,12 +1526,11 @@ void loop(void) {
   if (Serial.available()) {
     char key = Serial.read();
     if ((key == 'h') || (key == 'H') || (key == '?')) {
-      printCommandMenu();
+      printSerialCommandMenu();
     }
     if (key == 'r' || key == 'R') {
       Serial.println("Rebooting device...");
-      resetDisplay();
-      resetDevice();
+      reboot();
     }
     if (key == 'p' || key == 'P') {
       enableLogData = !enableLogData;
@@ -1315,6 +1541,12 @@ void loop(void) {
       enablePrintScaleData = !enablePrintScaleData;
       Serial.print("Scale data logging is ");
       Serial.println(enablePrintScaleData ? "ON" : "OFF");
+      if (enablePrintScaleData) {
+        for (uint8_t i = 0; i < PORT_COUNT; i++) {
+          Serial.print("s" + String(i) + " raw\ts" + String(i) + " kg\t");
+        }
+        Serial.print("\n");
+      }
     }
     if (key == 'l' || key == 'L') {
       enableLogUpdates = !enableLogUpdates;
@@ -1325,9 +1557,7 @@ void loop(void) {
       writeEeprom();
     }
     if (key == 'd' || key == 'D') {
-      Serial.println("Running display tests...");
       displayTest();
-      Serial.println("...done.");
     }
     if ((key == 'o') || (key == 'O')) {
       calibrateOffsets();
@@ -1389,5 +1619,10 @@ void loop(void) {
         setLedState(pos, LED_OFF);
       }
     }
+  }
+
+  if (rebootRequired && (millis() >= rebootTimeMillis)) {
+    //writeEeprom();
+    reboot();
   }
 }
