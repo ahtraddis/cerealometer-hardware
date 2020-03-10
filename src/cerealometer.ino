@@ -4,35 +4,29 @@
  * Copyright (c) 2020 Eric Schwartz
  */
 
-/**
- * TODO:
- * Test with incorrect device_id (all green LEDs?)
- */
+// Configuration options
 
-// Enable/disable options
-#define DEBUG false
+//#define DEBUG
 //#define USE_FIREBASE_CALLBACK
-
-#define BOOT_MESSAGE "Cerealometer v0.1 Copyright (c) 2020 Eric Schwartz"
-
+#define ENABLE_WEBSERVER
 // These non-essential features are disabled due to limited flash memory on the
 // SparkFun Thing Dev board. Uncomment to enable them if your hardware so allows!
 //#define ENABLE_MDNS
-#define ENABLE_WEBSERVER
-//#define USE_WIFI_MULTI
+#define ENABLE_SERIAL_COMMANDS
+#define ENABLE_CALIBRATE
+//#define ENABLE_LED_EFFECTS
 
 // Local config file including URLs and credentials
 #include "config.h"
+#include "debug.h"
+#ifdef ENABLE_WEBSERVER
 #include "templates.h"
+#endif
 
 // FirebaseESP8266.h must be included before ESP8266Wifi.h
-#include "FirebaseESP8266.h"
+#include "FirebaseESP8266.h" // v2.7.8 originally tested
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
-// [MEMORY] Note: ESP8266WiFiMulti.h lib and code uses +2036 bytes
-#ifdef USE_WIFI_MULTI
-#include <ESP8266WiFiMulti.h>
-#endif
 // [MEMORY] Note: ESP8266mDNS.h lib and code uses +21808 bytes
 #ifdef ENABLE_MDNS
 #include <ESP8266mDNS.h>
@@ -49,12 +43,19 @@
 
 // Constants
 
+// Boot message for cereal[sic] console
+#define BOOT_MESSAGE "Cerealometer v0.1 Copyright (c) 2020 Eric Schwartz"
+// Minimum time between weight POST for a given slot
 #define WEIGHT_MEASURE_INTERVAL_MS 500
+// Number of scale readings to take before averaging
 #define STATS_WINDOW_LENGTH 10
+// Weight threshold above which object is considered present
 #define PRESENCE_THRESHOLD_KG 0.001
+// Expected weight to use for scale calibration
 #define CALIBRATION_WEIGHT_KG 0.1
 // Minimum change of averaged weight_kg required to trigger data upload
 #define KG_CHANGE_THRESHOLD 0.001
+// Maximum deviation for weight reading to settle
 #define STD_DEV_THRESHOLD 0.03
 // Slot statuses
 #define STATUS_UNKNOWN 0
@@ -78,24 +79,41 @@
 #define LED_RED_BREATHE 10
 #define LED_GREEN 11
 #define LED_GREEN_BLINK 12
-#define LED_GREEN_BLINK_FAST 13
+#define LED_GREEN_BLINK_FAST 13 // not used
 #define LED_GREEN_BREATHE 14
 #define LED_BLUE 15
 #define LED_BLUE_BLINK 16
-#define LED_BLUE_BLINK_FAST 17
+#define LED_BLUE_BLINK_FAST 17 // not used
 #define LED_BLUE_BREATHE 18
 #define LED_WHITE 19
-#define LED_WHITE_BLINK 20
-#define LED_WHITE_BLINK_FAST 21
-#define LED_YELLOW 22
-#define LED_PURPLE 23
-#define LED_CYAN 24
+#define LED_WHITE_BLINK 20 // not used
+#define LED_WHITE_BLINK_FAST 21 // not used
+#define LED_YELLOW 22 // not used
+#define LED_PURPLE 23 // not used
+#define LED_CYAN 24 // not used
+
+uint8_t STATUS_TO_LED_STATE[] = {
+  LED_OFF,          // 0 STATUS_UNKNOWN
+  LED_INITIALIZING, // 1 STATUS_INITIALIZING
+  LED_VACANT,       // 2 STATUS_VACANT
+  LED_LOADED,       // 3 STATUS_LOADED
+  LED_UNLOADED,     // 4 STATUS_UNLOADED
+  LED_CLEARING,     // 5 STATUS_CLEARING
+  LED_CALIBRATING   // 6 STATUS_CALIBRATING
+};
 
 // LED control and timing
 #define COLOR_COUNT 3
-#define R 0
-#define G 1
-#define B 2
+#define R 0 // array index for red
+#define G 1 // array index for green
+#define B 2 // array index for blue
+// Macros to minimize repeated variable assignment
+#define RDEV led_pins[pos][R][DEV]
+#define GDEV led_pins[pos][G][DEV]
+#define BDEV led_pins[pos][B][DEV]
+#define RPIN led_pins[pos][R][PIN]
+#define GPIN led_pins[pos][G][PIN]
+#define BPIN led_pins[pos][B][PIN]
 #define DEV 0 // array index for SX1509 device
 #define PIN 1 // array index for SX1509 pin
 #define BLINK_ON_MS 500
@@ -124,7 +142,6 @@
 #define HX711_DT4 5 // GPIO5 (also tied to on-board LED)
 #define HX711_DT5 16 // GPIO16, XPD (can be used to wake from deep sleep)
 
-#define TARE_TIMEOUT_MS 2000 // less than ~3 secs to avoid tripping watchdog timer
 byte DATA_OUTS[] = { HX711_DT0, HX711_DT1, HX711_DT2, HX711_DT3, HX711_DT4, HX711_DT5 };
 #define PORT_COUNT sizeof(DATA_OUTS) / sizeof(byte)
 long int scale_results[PORT_COUNT];
@@ -134,6 +151,7 @@ HX711MULTI scales(PORT_COUNT, DATA_OUTS, HX711_CLK);
 #define EEPROM_ADDR 0
 #define EEPROM_LEN 512
 #define WIFI_CONNECT_TIMEOUT_MS 8000
+#define REBOOT_DELAY_MILLIS 2000
 
 // Macros
 #define MIN(a,b) (((a)<(b))?(a):(b))
@@ -142,9 +160,6 @@ HX711MULTI scales(PORT_COUNT, DATA_OUTS, HX711_CLK);
 
 // Globals
 
-#ifdef USE_WIFI_MULTI
-ESP8266WiFiMulti wifiMulti;
-#endif
 #ifdef ENABLE_WEBSERVER
 // Create webserver object listening for HTTP requests on port 80
 ESP8266WebServer server(80);
@@ -156,7 +171,7 @@ FirebaseData firebaseData;
 HTTPClient http;
 
 // SX1509 I/O expander array
-byte SX1509_I2C_ADDRESSES[2] = { 0x3E, 0x70 };
+byte SX1509_I2C_ADDRESSES[] = { 0x3E, 0x70 };
 #define SX1509_COUNT sizeof(SX1509_I2C_ADDRESSES) / sizeof(byte)
 // device and pins used for external interrupt to toggle nReset lines
 #define SX1509_INT_DEVICE 1
@@ -166,7 +181,7 @@ byte SX1509_I2C_ADDRESSES[2] = { 0x3E, 0x70 };
 SX1509 io[SX1509_COUNT];
 // SX1509 device and pin mappings for the 6 RGB LEDs
 // Each pair represents {device, pin} for the LED pins in RGB order
-const int led_pins[PORT_COUNT][COLOR_COUNT][2] = {
+const static uint8_t led_pins[PORT_COUNT][COLOR_COUNT][2] = {
   { {0, 4}, {1, 4}, {0, 14} },
   { {0, 5}, {1, 5}, {0, 15} },
   { {0, 6}, {1, 6}, {1, 14} },
@@ -176,6 +191,7 @@ const int led_pins[PORT_COUNT][COLOR_COUNT][2] = {
 };
 
 // RGB color sequence used for display tests
+#ifdef ENABLE_LED_EFFECTS
 const static boolean rgbSeq[][COLOR_COUNT] = {
   { 1, 0, 0 }, // red
   { 0, 1, 0 }, // green
@@ -185,14 +201,26 @@ const static boolean rgbSeq[][COLOR_COUNT] = {
   { 1, 0, 1 }, // purple
   { 0, 1, 1 }, // cyan
 };
+#endif
 
-char buff[10]; // for string formatting
+char buff[6]; // for float to string formatting
 // Serial command states
+#ifdef ENABLE_SERIAL_COMMANDS
 boolean enablePrintScaleData = false;
 boolean enableLogData = false;
 boolean enableLogUpdates = false;
 uint8_t slotSelected = 0;
+#endif
+byte ledOnIntensity = 64;
+byte ledOffIntensity = 0;
 
+char* device_id = "";
+char* wifi_ssid = "";
+char* wifi_password = "";
+char* firebase_project_id = "";
+char* firebase_db_secret = "";
+
+// Flag and timestamp to invoke reboot in loop()
 boolean rebootRequired = false;
 unsigned long rebootTimeMillis = 0;
 
@@ -205,29 +233,23 @@ typedef struct {
   char firebase_db_secret[64] = "";
   long offsets[PORT_COUNT] = {0};
   int calibration_factors[PORT_COUNT] = {0};
+  uint8_t led_on_intensity = 255;
 } EepromData;
 
 EepromData eepromData;
 
-char* device_id = "";
-char* wifi_ssid = "";
-char* wifi_password = "";
-char* firebase_project_id = "";
-char* firebase_db_secret = "";
 // Load cell offsets and calibration factors.
 // Tare offset corresponds to the HX711 value with no load present.
 long int hx711_tare_offsets[PORT_COUNT] = {0};
 // Calibration factor is the linear conversion factor to scale value to kilograms.
 int hx711_calibration_factors[PORT_COUNT] = {0};
 
+// Port (aka slot) data
 typedef struct {
-  int calibration_factor;
-  float last_weight_kilograms; // last value uploaded
+  float last_weight_kilograms; // last value uploaded to cloud
   float current_weight_kilograms; // most recent sample
   Statistic stats;
-  byte data_pin;
-  byte clock_pin;
-  unsigned long lastWeightMeasurementPushMillis;
+  unsigned long lastWeightMeasurementPushMillis; // time last uploaded to cloud
   byte status;
 } Port;
 
@@ -235,154 +257,162 @@ Port ports[PORT_COUNT];
 byte currentLedStates[PORT_COUNT];
 
 // Function prototypes
+void ledWaveRight(byte ledState, int delayMs=100);
+#ifdef ENABLE_LED_EFFECTS
 void ledBreatheRow(uint8_t colorIndex=0, byte onIntensity=255, int delayMs=0, int delayStepMs=1);
 void ledFadeUpRow(boolean r=0, boolean g=0, boolean b=0, byte onIntensity=255, int delayMs=0, int delayStepMs=1);
 void ledFadeDownRow(boolean r=0, boolean g=0, boolean b=0, byte onIntensity=255, int delayMs=0, int delayStepMs=1);
-void ledWaveRight(boolean r=0, boolean g=0, boolean b=0, int delayMs=100);
 void ledRandom(int maxCount=1, int delayMs=0, int delayStepMs=1);
-void setLedState(uint8_t pos, uint8_t state=LED_OFF, boolean sync=true);
-void setAllLedStates(uint8_t state=LED_OFF, boolean sync=true);
 void ledCylon(int count=10, int delayMs=150);
+#endif
+void setLedState(uint8_t pos, uint8_t state=LED_OFF, boolean sync=true, boolean force=false);
+void setAllLedStates(uint8_t state=LED_OFF, boolean sync=true, boolean force=false);
+void restoreLedStates(boolean force=false);
 void getAverageScaleData(long *result, byte times=10);
 #ifdef ENABLE_WEBSERVER
 void handleRoot();
 void handleSettings();
+#ifdef ENABLE_CALIBRATE
 void handleCalibrate();
+#endif
 void handleUtil();
 void handleLoading();
 #endif
 
 // Global functions
 
+String getBaseUrl() {
+  String baseUrl = REST_API_BASEURL_PATTERN;
+  baseUrl.replace("%%FIREBASE_PROJECT_ID%%", firebase_project_id);
+  return baseUrl;
+}
+// Retrieve initial port data for device via GET
 int getPortData(String device_id) {
-  Serial.print("Fetching initial port data...");
-  String url = REST_API_BASEURL_PATTERN;
-  url.replace("%%FIREBASE_PROJECT_ID%%", firebase_project_id);
-  http.begin(url + String("/getDevice?device_id=") + device_id);
+  DEBUG_PRINT("Fetching initial port data...");
+  http.begin(getBaseUrl() + String("/getDevice?device_id=") + device_id);
   http.addHeader("Content-Type", "application/json");
   int httpCode = http.GET();
+
   if (httpCode == HTTP_CODE_OK) {
-    Serial.println(" success.");
+    DEBUG_PRINTLN(" success.");
     String response = http.getString();
     String data_list = jsonExtract(response, "data");
     // Parse response, set status and LED state for each slot
     // [eschwartz-TODO] Only do this if len of array == PORT_COUNT
     for (uint8_t i = 0; i < PORT_COUNT; i++) {
       String slotStr = jsonIndexList(data_list, i);
-      if (DEBUG) {
-        Serial.print("slot " + String(i) + ": ");
-        Serial.println(slotStr);
-      }
+      DEBUG_PRINT("slot " + String(i) + ": ");
+      DEBUG_PRINTLN(slotStr);
       String statusStr = jsonExtract(slotStr, "status");
       byte status = statusStringToInt(statusStr);
       ports[i].status = status;
       setLedState(i, status);
     }
   } else {
-    Serial.println(" FAILED.");
-    Serial.print("HTTP response error ");
-    Serial.println(httpCode);
-    String response = http.getString();
-    Serial.println(response);
+    DEBUG_PRINTLN(" FAILED.");
+    DEBUG_PRINTLN("HTTP response error " + String(httpCode));
   }
   http.end();
 }
 
 int setWeight(String device_id, int slot, float weight_kg) {
   // Open https connection to setWeight cloud function
-  String url = REST_API_BASEURL_PATTERN;
-  url.replace("%%FIREBASE_PROJECT_ID%%", firebase_project_id);
   // [eschwartz-TODO] Re-test with https, import SHA1_FINGERPRINT from config (2nd param):
-  http.begin(url + String("/setWeight"));
+  http.begin(getBaseUrl() + String("/setWeight"));
   http.addHeader("Content-Type", "application/json");
-  String data = String("{\"device_id\": \"") + device_id
-    + String("\", \"slot\": \"") + String(slot)
-    + String("\", \"weight_kg\": ") + dtostrf(weight_kg, 2, 4, buff)
+  String data = String("{\"device_id\":\"") + device_id
+    + String("\",\"slot\":\"") + String(slot)
+    + String("\",\"weight_kg\":") + dtostrf(weight_kg, 2, 4, buff)
     + String("}");
   // [eschwartz-TODO]: This should probably be a PUT to /ports/<device_id>/data/<slot>
   int httpCode = http.POST(data);
-  String payload = http.getString();
 
   if (httpCode > 0) {
-    if (DEBUG) {
-      String payload = http.getString(); // response payload 
-      Serial.print("Slot ");
-      Serial.print(slot);
-      Serial.print(" setWeight SUCCESS, httpCode = ");
-      Serial.println(httpCode);
-    }
+    DEBUG_PRINT("Slot ");
+    DEBUG_PRINT(slot);
+    DEBUG_PRINT(" setWeight SUCCESS, httpCode = ");
+    DEBUG_PRINTLN(httpCode);
   } else {
-    Serial.print("Slot ");
-    Serial.print(slot);
-    Serial.print(" setWeight FAILED: httpCode = ");
-    Serial.print(httpCode);
-    Serial.print(", error = ");
-    Serial.println(http.errorToString(httpCode));
+    DEBUG_PRINT("Slot ");
+    DEBUG_PRINT(slot);
+    DEBUG_PRINT(" setWeight FAILED: httpCode = ");
+    DEBUG_PRINT(httpCode);
+    DEBUG_PRINT(", error = ");
+    DEBUG_PRINTLN(http.errorToString(httpCode));
   }
   http.end();
 }
-
+#ifdef ENABLE_SERIAL_COMMANDS
 void printCurrentValues() {
-  Serial.print("Weights (kg): ");
+  DEBUG_PRINT("Weights (kg): ");
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
-    Serial.print(ports[i].current_weight_kilograms, 4);
-    Serial.print((i != PORT_COUNT - 1) ? "\t" : "\n");
+    DEBUG_PRINTDP(ports[i].current_weight_kilograms, 4);
+    DEBUG_PRINT((i != PORT_COUNT - 1) ? "\t" : "\n");
   }
 }
 
 void printLogMessage(uint8_t slot, float kg_change) {
-  Serial.print("Slot ");
-  Serial.print(slot);
-  Serial.print(" CHANGED: ");
-  Serial.print("count: ");
-  Serial.print(ports[slot].stats.count());
-  Serial.print(", avg: ");
-  Serial.print(ports[slot].stats.average(), 4);
-  Serial.print(", std dev: ");
-  Serial.print(ports[slot].stats.pop_stdev(), 4);
-  Serial.print(", last: ");
-  Serial.print(ports[slot].last_weight_kilograms, 4);
-  Serial.print(", curr: ");
-  Serial.print(ports[slot].stats.average(), 4);
-  Serial.print(", diff: ");
-  Serial.print(kg_change, 4);
-  Serial.print(" (> ");
-  Serial.print(KG_CHANGE_THRESHOLD, 4);
-  Serial.print(" kg)");
-  Serial.println();
+  DEBUG_PRINT("Slot ");
+  DEBUG_PRINT(slot);
+  DEBUG_PRINT(" CHANGED: ");
+  DEBUG_PRINT("count: ");
+  DEBUG_PRINT(ports[slot].stats.count());
+  DEBUG_PRINT(", avg: ");
+  DEBUG_PRINTDP(ports[slot].stats.average(), 4);
+  DEBUG_PRINT(", std dev: ");
+  DEBUG_PRINTDP(ports[slot].stats.pop_stdev(), 4);
+  DEBUG_PRINT(", last: ");
+  DEBUG_PRINTDP(ports[slot].last_weight_kilograms, 4);
+  DEBUG_PRINT(", curr: ");
+  DEBUG_PRINTDP(ports[slot].stats.average(), 4);
+  DEBUG_PRINT(", diff: ");
+  DEBUG_PRINTDP(kg_change, 4);
+  DEBUG_PRINT(" (> ");
+  DEBUG_PRINTDP(KG_CHANGE_THRESHOLD, 4);
+  DEBUG_PRINT(" kg)");
+  DEBUG_PRINTLN();
 }
+#endif
 
 // Restore LED states after disrupting them with tests
-void restoreLedStates() {
+void restoreLedStates(boolean force) {
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
-    setLedState(i, statusToLedState(ports[i].status));
+    setLedState(i, STATUS_TO_LED_STATE[ports[i].status], true, force);
   }
 }
 
+void resetDisplay() {
+  setAllLedStates(LED_OFF, false, true);
+}
+
+// Start LED wave pattern by setting each to breathe (or other ledState) with delayMs spacing
+void ledWaveRight(byte ledState, int delayMs) {
+  for (uint8_t pos = 0; pos < PORT_COUNT; pos++) {
+    setLedState(pos, ledState, false);
+    delay(delayMs);
+  }
+}
+#ifdef ENABLE_LED_EFFECTS
 // Run LED test sequences
 void displayTest() {
   int delayMs = 0;
   int delayStepMs = 1;
-  byte onIntensity = 255;
 
-  Serial.println("Running display tests...");
+  DEBUG_PRINTLN("Running display tests (ledOnIntensity=" + String(ledOnIntensity) + ")...");
   resetDisplay();
-  ledCylon(5);
-  delay(1000);
-  ledBreatheRow(R, onIntensity, delayMs, delayStepMs);
+  ledCylon(3);
+  delay(500);
+  ledBreatheRow(R, ledOnIntensity, delayMs, delayStepMs);
   delay(100);
-  ledBreatheRow(G, onIntensity, delayMs, delayStepMs);
+  ledBreatheRow(G, ledOnIntensity, delayMs, delayStepMs);
   delay(100);
-  ledBreatheRow(B, onIntensity, delayMs, delayStepMs);
+  ledBreatheRow(B, ledOnIntensity, delayMs, delayStepMs);
   delay(100);
   // Fade in/out rows with simple color combinations
   delayStepMs = 0;
   for (uint8_t i = 0; i < LEN(rgbSeq); i++) {
-    uint8_t r = rgbSeq[i][R];
-    uint8_t g = rgbSeq[i][G];
-    uint8_t b = rgbSeq[i][B];
-    ledFadeUpRow(r, g, b, onIntensity, delayMs, delayStepMs);
-    ledFadeDownRow(r, g, b, onIntensity, delayMs, delayStepMs);
+    ledFadeUpRow(rgbSeq[i][R], rgbSeq[i][G], rgbSeq[i][B], ledOnIntensity, delayMs, delayStepMs);
+    ledFadeDownRow(rgbSeq[i][R], rgbSeq[i][G], rgbSeq[i][B], ledOnIntensity, delayMs, delayStepMs);
     delay(500);
   }
   delay(100);
@@ -390,13 +420,7 @@ void displayTest() {
   resetDisplay();
   delay(1000);
   restoreLedStates();
-  Serial.println("...done.");
-}
-
-void resetDisplay() {
-  for (uint8_t pos = 0; pos < PORT_COUNT; pos++) {
-    setLedState(pos, LED_OFF);
-  }
+  DEBUG_PRINTLN("...done.");
 }
 
 void ledBreatheRow(uint8_t colorIndex, byte onIntensity, int delayMs, int delayStepMs)
@@ -404,11 +428,13 @@ void ledBreatheRow(uint8_t colorIndex, byte onIntensity, int delayMs, int delayS
   for (uint8_t pos = 0; pos < PORT_COUNT; pos++) {
     int device = led_pins[pos][colorIndex][DEV];
     int pin = led_pins[pos][colorIndex][PIN];
+    // ramp up
     for (int i = 0; i < (onIntensity + 1); i++) {
       io[device].analogWrite(pin, 255 - i); // syncing current, value is inverted
       delay(delayStepMs);
     }
     delay(delayMs);
+    // ramp down
     for (int i = onIntensity; i >= 0; i--) {
       io[device].analogWrite(pin, 255 - i);
       delay(delayStepMs);
@@ -421,9 +447,9 @@ void ledFadeUpRow(boolean r, boolean g, boolean b, byte onIntensity, int delayMs
 {
   for (int i = 0; i < (onIntensity + 1); i++) {
     for (uint8_t pos = 0; pos < PORT_COUNT; pos++) {
-      if (r) io[led_pins[pos][R][DEV]].analogWrite(led_pins[pos][R][PIN], 255 - i);
-      if (g) io[led_pins[pos][G][DEV]].analogWrite(led_pins[pos][G][PIN], 255 - i);
-      if (b) io[led_pins[pos][B][DEV]].analogWrite(led_pins[pos][B][PIN], 255 - i);
+      if (r) io[RDEV].analogWrite(RPIN, 255 - i);
+      if (g) io[GDEV].analogWrite(GPIN, 255 - i);
+      if (b) io[BDEV].analogWrite(BPIN, 255 - i);
     }
     delay(delayStepMs);
   }
@@ -434,23 +460,13 @@ void ledFadeDownRow(boolean r, boolean g, boolean b, byte onIntensity, int delay
 {
   for (int i = onIntensity; i >= 0; i--) {
     for (uint8_t pos = 0; pos < PORT_COUNT; pos++) {
-      if (r) io[led_pins[pos][R][DEV]].analogWrite(led_pins[pos][R][PIN], 255 - i);
-      if (g) io[led_pins[pos][G][DEV]].analogWrite(led_pins[pos][G][PIN], 255 - i);
-      if (b) io[led_pins[pos][B][DEV]].analogWrite(led_pins[pos][B][PIN], 255 - i);
+      if (r) io[RDEV].analogWrite(RPIN, 255 - i);
+      if (g) io[GDEV].analogWrite(GPIN, 255 - i);
+      if (b) io[BDEV].analogWrite(BPIN, 255 - i);
     }
     delay(delayStepMs);
   }
   delay(delayMs);
-}
-
-// Start LED wave pattern by setting all to breathe with delay in between
-void ledWaveRight(boolean r, boolean g, boolean b, int delayMs) {
-  for (uint8_t pos = 0; pos < PORT_COUNT; pos++) {
-    if (r) io[led_pins[pos][R][DEV]].breathe(led_pins[pos][R][PIN], BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS);
-    if (g) io[led_pins[pos][G][DEV]].breathe(led_pins[pos][G][PIN], BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS);
-    if (b) io[led_pins[pos][B][DEV]].breathe(led_pins[pos][B][PIN], BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS);
-    delay(delayMs);
-  }
 }
 
 void ledRandom(int maxCount, int delayMs, int delayStepMs)
@@ -466,22 +482,22 @@ void ledRandom(int maxCount, int delayMs, int delayStepMs)
     step = 4;
     pos = random(0, PORT_COUNT);
     for (int i = 0; i < (intensity + 1); i += step) {
-      if (r) io[led_pins[pos][R][DEV]].analogWrite(led_pins[pos][R][PIN], 255 - i);
-      if (g) io[led_pins[pos][G][DEV]].analogWrite(led_pins[pos][G][PIN], 255 - i);
-      if (b) io[led_pins[pos][B][DEV]].analogWrite(led_pins[pos][B][PIN], 255 - i);
+      if (r) io[RDEV].analogWrite(RPIN, 255 - i);
+      if (g) io[GDEV].analogWrite(GPIN, 255 - i);
+      if (b) io[BDEV].analogWrite(BPIN, 255 - i);
       delay(delayStepMs);
     }
     delay(delayMs);
     for (int i = intensity; i >= 0; i -= step) {
-      if (r) io[led_pins[pos][R][DEV]].analogWrite(led_pins[pos][R][PIN], 255 - i);
-      if (g) io[led_pins[pos][G][DEV]].analogWrite(led_pins[pos][G][PIN], 255 - i);
-      if (b) io[led_pins[pos][B][DEV]].analogWrite(led_pins[pos][B][PIN], 255 - i);
+      if (r) io[RDEV].analogWrite(RPIN, 255 - i);
+      if (g) io[GDEV].analogWrite(GPIN, 255 - i);
+      if (b) io[BDEV].analogWrite(BPIN, 255 - i);
       delay(delayStepMs);
     }
     // turn off in case stepping missed the 0 value
-    if (r) io[led_pins[pos][R][DEV]].analogWrite(led_pins[pos][R][PIN], 255);
-    if (g) io[led_pins[pos][G][DEV]].analogWrite(led_pins[pos][G][PIN], 255);
-    if (b) io[led_pins[pos][B][DEV]].analogWrite(led_pins[pos][B][PIN], 255);
+    if (r) io[RDEV].analogWrite(RPIN, 255);
+      if (g) io[GDEV].analogWrite(GPIN, 255);
+      if (b) io[BDEV].analogWrite(BPIN, 255);
     delay(delayMs);
   }
 }
@@ -491,338 +507,136 @@ void ledCylon(int count, int delayMs) {
   uint8_t device, pin, endPos;
   while (counter++ < count) {
     endPos = (counter == count) ? 0 : 1;
+    // to the right
     for (int pos = 0; pos < PORT_COUNT; pos++) {
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].analogWrite(pin, 0);
+      io[RDEV].analogWrite(RPIN, 0);
       delay(delayMs);
-      io[device].analogWrite(pin, 255);
+      io[RDEV].analogWrite(RPIN, 255);
     }
+    // to the left
     for (int pos = (PORT_COUNT - 2); pos >= endPos; pos--) {
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].analogWrite(pin, 0);
+      io[RDEV].analogWrite(RPIN, 0);
       delay(delayMs);
-      io[device].analogWrite(pin, 255);
+      io[RDEV].analogWrite(RPIN, 255);
     }
   }
 }
+#endif
 
-void setAllLedStates(uint8_t state, boolean sync) {
+void setAllLedStates(uint8_t state, boolean sync, boolean force) {
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
-    setLedState(i, state, sync);
+    setLedState(i, state, false, force);
   }
-}
-
-// Set LED state
-// To stop blink:
-// io[device].setupBlink(pin, 0, 0, 255);
-// See https://forum.sparkfun.com/viewtopic.php?t=48433)
-// Notes:
-// State changes are a bit messy due to limitations on turning OFF blink
-// and breathe via the SX1509.
-// To stop a pin that is "breathing", do a digitalWrite() of HIGH to enter single-shot mode.
-void setLedState(uint8_t pos, uint8_t state, boolean sync) {
-  if (state == currentLedStates[pos]) return; // already set
-  int device;
-  int pin;
-  switch (state) {
-    case LED_RED:
-    case LED_LOADED:
-      // solid red ala Whole Foods parking lot
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      break;
-    case LED_RED_BLINK:
-    case LED_UNLOADED:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      break;
-    case LED_RED_BLINK_FAST:
-    case LED_CLEARING:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].blink(pin, BLINK_FAST_ON_MS, BLINK_FAST_OFF_MS); // start blink
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      // blue
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      break;
-    case LED_RED_BREATHE:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].breathe(pin, BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS); // start breathe
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      break;
-    case LED_GREEN:
-    case LED_VACANT:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      // solid green ala Whole Foods parking lot
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      break;
-    case LED_GREEN_BLINK:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      break;
-    case LED_GREEN_BLINK_FAST:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].blink(pin, BLINK_FAST_ON_MS, BLINK_FAST_OFF_MS); // start blink
-      // blue
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      break;
-    case LED_GREEN_BREATHE:
-    case LED_INITIALIZING:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      io[device].breathe(pin, BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS); // start breathe
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      break;
-    case LED_BLUE:
-    case LED_CALIBRATING:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
-      break;
-    case LED_BLUE_BLINK:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
-      break;    
-    case LED_BLUE_BLINK_FAST:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
-      break;
-    case LED_BLUE_BREATHE:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].digitalWrite(pin, LOW); // off
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].breathe(pin, BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS); // start breathe
-      break;
-    case LED_WHITE:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      io[device].digitalWrite(pin, HIGH); // stop breathe and stay on
-      break;
-    case LED_WHITE_BLINK:
-      // red
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
-      // green
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
-      // blue
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].blink(pin, BLINK_ON_MS, BLINK_OFF_MS); // start blink
-      break;
-    // case LED_YELLOW:
-    //   // do something
-    //   break;
-    // case LED_PURPLE:
-    //   // do something
-    //   break;
-    // case LED_CYAN:
-    //   // do something
-    //   break;
-    case LED_OFF:
-    default:
-      device = led_pins[pos][R][DEV];
-      pin = led_pins[pos][R][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      device = led_pins[pos][G][DEV];
-      pin = led_pins[pos][G][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      device = led_pins[pos][B][DEV];
-      pin = led_pins[pos][B][PIN];
-      io[device].digitalWrite(pin, HIGH); // stop breathe
-      io[device].setupBlink(pin, 0, 0, 255); // stop blink
-      break;
-  }
-  currentLedStates[pos] = state;
   if (sync) syncLeds();
 }
 
-byte statusToLedState(byte status) {
-  byte val;
-  switch (status) {
-    case STATUS_UNKNOWN:
-      val = LED_OFF;
+// Stop any blinking or breathing on pins for colors in given LED position
+// See https://forum.sparkfun.com/viewtopic.php?t=48433)
+void checkStopBlinkBreathe(uint8_t pos) {
+  byte state = currentLedStates[pos];
+  if ((state == LED_RED_BLINK) || (state == LED_RED_BLINK_FAST) || (state == LED_UNLOADED)
+      || (LED_CLEARING) || (state == LED_RED_BREATHE)) {
+    DEBUG_PRINTLN("checkStopBlink: stop red blink: pos: " + String(pos));
+    io[RDEV].setupBlink(RPIN, 0, 0, 255); // stop red blink
+  }
+  if ((state == LED_GREEN_BLINK) || (state == LED_GREEN_BREATHE) || (state == LED_INITIALIZING)) {
+    DEBUG_PRINTLN("checkStopBlink: stop green blink: pos: " + String(pos));
+    io[GDEV].setupBlink(GPIN, 0, 0, 255); // stop green blink
+  }
+  if ((state == LED_BLUE_BLINK) || (state == LED_BLUE_BREATHE)) {
+    DEBUG_PRINTLN("checkStopBlink: stop blue blink: pos: " + String(pos));
+    io[BDEV].setupBlink(BPIN, 0, 0, 255); // stop blue blink
+  }
+}
+
+// For called RGB colorIndex in LED position, turn off other 2 colors
+void isolateColor(uint8_t pos, uint8_t colorIndex) {
+  if (colorIndex == B) {
+    io[RDEV].analogWrite(RPIN, 255);
+  }
+  if (colorIndex == R || colorIndex == B) {
+    io[GDEV].analogWrite(GPIN, 255);
+  }
+  if (colorIndex == R || colorIndex == G) {
+    io[BDEV].analogWrite(BPIN, 255);
+  }
+}
+
+void setLedState(uint8_t pos, uint8_t state, boolean sync, boolean force) {
+  // Return if target state is already set, and force is not with us
+  if ((state == currentLedStates[pos]) && !force) return;
+
+  checkStopBlinkBreathe(pos); // if any color(s) blinking, stop
+
+  switch (state) {
+    case LED_RED:
+    case LED_LOADED:
+      // solid red a la Whole Foods parking lot
+      isolateColor(pos, R);
+      io[RDEV].analogWrite(RPIN, 255 - ledOnIntensity); 
       break;
-    case STATUS_VACANT:
-      val = LED_VACANT;
+    case LED_RED_BLINK:
+    case LED_UNLOADED:
+      isolateColor(pos, R);
+      io[RDEV].blink(RPIN, BLINK_ON_MS, BLINK_OFF_MS);
       break;
-    case STATUS_LOADED:
-      val = LED_LOADED;
+    case LED_RED_BLINK_FAST:
+    case LED_CLEARING:
+      isolateColor(pos, R);
+      io[RDEV].blink(RPIN, BLINK_FAST_ON_MS, BLINK_FAST_OFF_MS);
       break;
-    case STATUS_UNLOADED:
-      val = LED_UNLOADED;
+    case LED_RED_BREATHE:
+      isolateColor(pos, R);
+      io[RDEV].breathe(RPIN, BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS);
       break;
-    case STATUS_CLEARING:
-      val = LED_CLEARING;
+    case LED_GREEN:
+    case LED_VACANT:
+      // solid green a la Whole Foods parking lot
+      isolateColor(pos, G);
+      io[GDEV].analogWrite(GPIN, 255 - ledOnIntensity);
       break;
-    case STATUS_INITIALIZING:
-      val = LED_INITIALIZING;
+    case LED_GREEN_BLINK:
+      isolateColor(pos, G);
+      io[GDEV].blink(GPIN, BLINK_ON_MS, BLINK_OFF_MS);
       break;
-    case STATUS_CALIBRATING:
-      val = LED_CALIBRATING;
+    case LED_GREEN_BREATHE:
+    case LED_INITIALIZING:
+      isolateColor(pos, G);
+      io[GDEV].breathe(GPIN, BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS);
+      break;
+    case LED_BLUE:
+      // fyi, solid blue also appears in Whole Foods parking lot (reserved spaces)
+      isolateColor(pos, B);
+      io[BDEV].analogWrite(BPIN, 255 - ledOnIntensity);
+      break;
+    case LED_BLUE_BLINK:
+      isolateColor(pos, B);
+      io[BDEV].blink(BPIN, BLINK_ON_MS, BLINK_OFF_MS);
+      break;    
+    case LED_BLUE_BREATHE:
+      isolateColor(pos, B);
+      io[BDEV].breathe(BPIN, BREATHE_ON_MS, BREATHE_OFF_MS, BREATHE_RISE_MS, BREATHE_FALL_MS);
+      break;
+    case LED_WHITE:
+    case LED_CALIBRATING:
+      io[RDEV].analogWrite(RPIN, 255 - ledOnIntensity);
+      io[GDEV].analogWrite(GPIN, 255 - ledOnIntensity);
+      io[BDEV].analogWrite(BPIN, 255 - ledOnIntensity);
+      break;
+    case LED_OFF:
     default:
-      val = STATUS_UNKNOWN;
+      io[RDEV].analogWrite(RPIN, 255);
+      io[GDEV].analogWrite(GPIN, 255);
+      io[BDEV].analogWrite(BPIN, 255);
       break;
   }
-  return val;
+  currentLedStates[pos] = state;
+  // Sync LED timing if new state is blinking or breathing
+  if (sync && (state != LED_RED) && (state != LED_BLUE) && (state != LED_GREEN) &&
+      (state != LED_WHITE) && (state != LED_LOADED) && (state != LED_OFF) &&
+      (state != LED_VACANT)) {
+    syncLeds();
+  }
 }
 
 byte statusStringToInt(String status) {
@@ -845,120 +659,73 @@ byte statusStringToInt(String status) {
   return val;
 }
 
-String statusToString(byte status) {
-  String str;
-  switch (status) {
-    case STATUS_UNKNOWN:
-      str = "UNKNOWN";
-      break;
-    case STATUS_VACANT:
-      str = "VACANT";
-      break;
-    case STATUS_LOADED:
-      str = "LOADED";
-      break;
-    case STATUS_UNLOADED:
-      str = "UNLOADED";
-      break;
-    case STATUS_CLEARING:
-      str = "CLEARING";
-      break;
-    case STATUS_INITIALIZING:
-      str = "INITIALIZING";
-      break;
-    default:
-      str = "UNKNOWN";
-      break;
-  }
-  return str;
-}
-
 void streamCallback(StreamData data) {
-  if (DEBUG) {
-    Serial.println("___________ Stream callback data received __________");
-    Serial.println("streamPath: " + data.streamPath());
-    Serial.println("dataPath:   " + data.dataPath());
-    Serial.println("dataType:   " + data.dataType());
-    Serial.println("eventType:  " + data.eventType());
-    Serial.print(  "value:      ");
-  }
-  if (data.dataType() == "int") {
-    if (DEBUG) Serial.println(data.intData());
-  }
-  else if (data.dataType() == "float") {
-    if (DEBUG) Serial.println(data.floatData(), 5);
-  }
-  else if (data.dataType() == "double") {
-    if (DEBUG) printf("%.9lf\n", data.doubleData());
-  }
-  else if (data.dataType() == "boolean") {
-    if (DEBUG) Serial.println(data.boolData() == 1 ? "true" : "false");
-  }
-  else if (data.dataType() == "string") {
-    if (DEBUG) Serial.println(data.stringData());
-    if (data.dataPath().startsWith("/data/") && data.dataPath().endsWith("/status")) {
-      // Matched "/data/n/status", update slot status and LED state
+  DEBUG_PRINTLN("___________ Stream callback data received __________");
+  DEBUG_PRINTLN("streamPath: " + data.streamPath());
+  DEBUG_PRINTLN("dataPath:   " + data.dataPath());
+  DEBUG_PRINTLN("dataType:   " + data.dataType());
+  DEBUG_PRINTLN("eventType:  " + data.eventType());
+  DEBUG_PRINT(  "value:      ");
+  // if (data.dataType() == "int") {
+  //   DEBUG_PRINTLN(data.intData());
+  // }
+  // else (data.dataType() == "float") {
+  //   DEBUG_PRINTLN(String(data.floatData(), 5));
+  // }
+  // else if (data.dataType() == "double") {
+  //   printf("%.9lf\n", data.doubleData());
+  // }
+  // else if (data.dataType() == "boolean") {
+  //   DEBUG_PRINTLN(data.boolData() == 1 ? "true" : "false");
+  // }
+  // else if (data.dataType() == "array") {
+  //   DEBUG_PRINTLN("got dataType() 'array'");
+  // }
+  // else if (data.dataType() == "json") {
+  //   DEBUG_PRINTLN(data.jsonString());
+  // }
+  if ((data.dataType() == "string") || (data.dataType() == "null")) {
+    DEBUG_PRINTLN(data.stringData());
+    if (data.dataPath().startsWith("/data/")) {
       // [eschwartz-TODO] This assumes single digit slot number. Change to allow multi digit.
-      uint8_t slot = data.dataPath().substring(6, 7).toInt();
+      uint8_t slot = data.dataPath().substring(6, 7).toInt(); // extract from '/data/n'
       if ((slot >= 0) && (slot < PORT_COUNT)) {
-        byte status = statusStringToInt(data.stringData());
+        // If matched "/data/n/status", update slot status otherwise set to unknown
+        byte status = data.dataPath().endsWith("/status") ? statusStringToInt(data.stringData()) : STATUS_UNKNOWN;
         ports[slot].status = status;
-        setLedState(slot, statusToLedState(status));
+        // Update LED state
+        // [eschwartz-TODO] LED is turning off upon update from deleted port to VACANT
+        setLedState(slot, STATUS_TO_LED_STATE[status]);
       }
     }
   }
-  else if (data.dataType() == "json") {
-    // [eschwartz-TODO] Parse this and set status for each port upon startup
-    // (it gets invoked when callback is set)
-    Serial.println("INITIAL JSON:");
-    Serial.println(data.jsonString());
-    //if (DEBUG) Serial.println(data.jsonString());
-  }
-  else if (data.dataType() == "array") {
-    if (DEBUG) Serial.println("got dataType() 'array'");
-  }
-  else if (data.dataType() == "null") {
-    // something was deleted
-    if (data.dataPath().startsWith("/data/") && !data.dataPath().endsWith("/status")) {
-      // matched "/data/n" (if dataType is 'null', port was deleted)
-      // [eschwartz-TODO] This assumes single digit slot number. Change to allow multi digit.
-      uint8_t slot = data.dataPath().substring(6, 7).toInt();
-      if ((slot >= 0) && (slot < PORT_COUNT)) {
-        ports[slot].status = STATUS_UNKNOWN;
-        setLedState(slot, statusToLedState(STATUS_UNKNOWN));
-      }
-    }
-  }
+  
 }
 
 void streamTimeoutCallback(boolean timeout) {
   if (timeout) {
     // Stream timeout occurred
-    //if (DEBUG) Serial.println("Stream timeout, resuming...");
+    DEBUG_PRINTLN("Stream timeout, resuming...");
   }  
 }
 
 #ifdef ENABLE_WEBSERVER
-
-String styleHtml() {
-  String html = styleHtmlTemplate;
-  return html;
-}
-
-String scriptHtml() {
-  String html = scriptHtmlTemplate;
-  return html;
+// Check for and validate param in server POST args
+String getParamVal(String param, uint8_t minLength, uint8_t maxLength) {
+  String result = "";
+  if (server.hasArg(param)) {
+    String val = server.arg(param);
+    if (val.length() >= minLength && val.length() <= maxLength) {
+      result = val;
+    }
+  }
+  return result;
 }
 
 String headerHtml() {
   String html = headerHtmlTemplate;
-  html.replace("{STYLE}", styleHtml());
-  html.replace("{SCRIPT}", scriptHtml());
-  return html;
-}
-
-String footerHtml() {
-  String html = footerHtmlTemplate;
+  html.replace("{STYLE}", styleHtmlTemplate);
+  html.replace("{SCRIPT}", scriptHtmlTemplate);
   return html;
 }
 
@@ -969,37 +736,43 @@ String settingsHtml() {
   html.replace("{WIFI_PASSWORD}", wifi_password);
   html.replace("{FIREBASE_PROJECT_ID}", firebase_project_id);
   html.replace("{FIREBASE_DB_SECRET}", firebase_db_secret);
+  html.replace("{LED_ON_INTENSITY}", String(ledOnIntensity));
   return html;
 }
-
+#ifdef ENABLE_CALIBRATE
 String calibrateHtml() {
   String html = calibrateHtmlTemplate;
   String tableRowsHtml = "";
+
+  // Convert status code int to string
+  const char* STATUS_TO_STRING[] = {
+    "UNKNOWN",      // 0 STATUS_UNKNOWN
+    "INITIALIZING", // 1 STATUS_INITIALIZING
+    "VACANT",       // 2 STATUS_VACANT
+    "LOADED",       // 3 STATUS_LOADED
+    "UNLOADED",     // 4 STATUS_UNLOADED
+    "CLEARING",     // 5 STATUS_CLEARING
+    "CALIBRATING"   // 6 STATUS_CALIBRATING
+  };
+
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
     String rowHtml = calibrateRowHtmlTemplate;
+    rowHtml.replace("{SLOT}", String(i));
     rowHtml.replace("{PORT}", String(i + 1));
     rowHtml.replace("{LAST_WEIGHT_KILOGRAMS}", String(dtostrf(ports[i].last_weight_kilograms, 2, 4, buff)));
     rowHtml.replace("{TARE_OFFSET}", String(hx711_tare_offsets[i]));
     rowHtml.replace("{CALIBRATION_FACTOR}", String(hx711_calibration_factors[i]));
-    rowHtml.replace("{STATUS}", statusToString(ports[i].status));
+    rowHtml.replace("{STATUS}", STATUS_TO_STRING[ports[i].status]);
     tableRowsHtml += rowHtml;
   }
   html.replace("{TABLE_ROWS}", tableRowsHtml);
     
   return html;
 }
-
-String utilHtml() {
-  String html = utilHtmlTemplate;
-  return html;
-}
-
+#endif
 String loadingHtml() {
-  String html = loadingHtmlTemplate;
-  html.replace("{STYLE}", styleHtml());
-  // [eschwartz-TODO] Not sure why but these URLs are breaking the raw string when inserted in the template
-  html.replace("{URL1}", "https://ajax.googleapis.com/ajax/libs/jquery/3.4.1/jquery.min.js");
-  html.replace("{URL2}", "https://loading.io/mod/spinner/spinner/index.svg");
+String html = loadingHtmlTemplate;
+  html.replace("{STYLE}", styleHtmlTemplate);
   return html;
 }
 
@@ -1010,96 +783,96 @@ void handleRoot() {
 }
 
 void handleSettings() {
+  String val;
+
   if (server.method() == HTTP_GET) {
-    server.send(200, "text/html", headerHtml() + settingsHtml() + footerHtml());
+    server.send(200, "text/html", headerHtml() + settingsHtml() + footerHtmlTemplate);
   }
   else if (server.method() == HTTP_POST) {
-    boolean updateRequired = false;
     // [eschwartz-TODO] Validate all inputs
-    if (server.hasArg("device_id")) {
-      String str_device_id = server.arg("device_id");
-      if (str_device_id.length() > 0 && str_device_id.length() < 32) {
-        Serial.println("Updating device ID...");
-        strcpy(device_id, str_device_id.c_str());
-        updateRequired = true;
-      }
+    val = getParamVal("device_id", 1, 31);
+    if (val) {
+      strcpy(device_id, val.c_str());
     }
-    if (server.hasArg("firebase_project_id")) {
-      String str_firebase_project_id = server.arg("firebase_project_id");
-      if (str_firebase_project_id.length() > 0 && str_firebase_project_id.length() < 64) {
-        Serial.println("Updating Firebase project ID...");
-        strcpy(firebase_project_id, str_firebase_project_id.c_str());
-        updateRequired = true;
-      }
+
+    val = getParamVal("firebase_project_id", 1, 63);
+    if (val) {
+      strcpy(firebase_project_id, val.c_str());
     }
-    if (server.hasArg("firebase_db_secret")) {
-      String str_firebase_db_secret = server.arg("firebase_db_secret");
-      if (str_firebase_db_secret.length() > 0 && str_firebase_db_secret.length() < 64) {
-        Serial.println("Updating Firebase database secret...");
-        strcpy(firebase_db_secret, str_firebase_db_secret.c_str());
-        updateRequired = true;
-      }
+
+    val = getParamVal("firebase_db_secret", 1, 63);
+    if (val) {
+      strcpy(firebase_db_secret, val.c_str());
     }
-    if (server.hasArg("wifi_ssid")) {
-      String str_wifi_ssid = server.arg("wifi_ssid");
-      if (str_wifi_ssid.length() > 0 && str_wifi_ssid.length() < 32) {
-        Serial.println("Updating WiFi SSID...");
-        strcpy(wifi_ssid, str_wifi_ssid.c_str());
-        updateRequired = true;
-      }
+
+    val = getParamVal("wifi_ssid", 1, 31);
+    if (val) {
+      strcpy(wifi_ssid, val.c_str());
     }
-    if (server.hasArg("wifi_password")) {
-      String str_wifi_password = server.arg("wifi_password");
-      if (str_wifi_password.length() > 0 && str_wifi_password.length() < 32) {
-        Serial.println("Updating WiFi password...");
-        strcpy(wifi_password, str_wifi_password.c_str());
-        updateRequired = true;
-      }
+
+    val = getParamVal("wifi_password", 1, 31);
+    if (val) {
+      strcpy(wifi_password, val.c_str());
+    }
+
+    val = getParamVal("led_on_intensity", 1, 3);
+    if (val) {
+      ledOnIntensity = val.toInt();
+      restoreLedStates(true); // force state refresh to reinit intensity
     }
 
     // Redirect to loading page for reboot
     server.sendHeader("Location", "/loading");
     server.send(303);
     
-    if (updateRequired) {
+    // Write to EEPROM and reboot if any setting was successfully changed
+    if (val) {
       writeEeprom();
       // Schedule reboot via loop() so this handler can exit
       rebootRequired = true;
-      rebootTimeMillis = millis() + 2000;
+      rebootTimeMillis = millis() + REBOOT_DELAY_MILLIS;
     }
   } else {
     server.send(405, "text/html", "Method Not Allowed");
   }
 }
-
+#ifdef ENABLE_CALIBRATE
 void handleCalibrate() {
   if (server.method() == HTTP_GET) {
-    server.send(200, "text/html", headerHtml() + calibrateHtml() + footerHtml());
+    server.send(200, "text/html", headerHtml() + calibrateHtml() + footerHtmlTemplate);
   }
   else if (server.method() == HTTP_POST) {
     if (server.hasArg("id")) {
       // Calibrate button clicked
       int factor = calibrateScaleFactor(server.arg("id").toInt());
+      // Send response for table update
       server.send(200, "text/html", String(factor));
     }
     if (server.hasArg("offsets")) {
       // Tare Scales button clicked 
       calibrateOffsets();
+      // Redirect to self to refresh
+      server.sendHeader("Location", "/calib");
+      server.send(303);
+    }
+    if (server.hasArg("savecal")) {
+      writeEeprom();
       server.sendHeader("Location", "/loading");
       server.send(303);
       // Schedule reboot via loop() so this handler can exit
       rebootRequired = true;
-      rebootTimeMillis = millis() + 2000;
+      rebootTimeMillis = millis() + REBOOT_DELAY_MILLIS;
     }
   }
   else {
     server.send(405, "text/html", "Method Not Allowed");
   }
 }
+#endif
 
 void handleUtil() {
   if (server.method() == HTTP_GET) {
-    server.send(200, "text/html", headerHtml() + utilHtml() + footerHtml());
+    server.send(200, "text/html", headerHtml() + utilHtmlTemplate + footerHtmlTemplate);
   }
   else if (server.method() == HTTP_POST) {
     if (server.hasArg("reboot")) {
@@ -1110,12 +883,15 @@ void handleUtil() {
       rebootRequired = true;
       rebootTimeMillis = millis() + 2000;
     }
+    #ifdef ENABLE_LED_EFFECTS
     if (server.hasArg("displaytest")) {
       // Run Display Tests button clicked, redirect to self
       server.sendHeader("Location", "/util");
       server.send(303);
       displayTest();
+      restoreLedStates(true); // force state refresh to reinit timing
     }
+    #endif
   }
   else {
     server.send(405, "text/html", "Method Not Allowed");
@@ -1128,27 +904,25 @@ void handleLoading() {
 // end of #ifdef ENABLE_WEBSERVER
 #endif
 
+#ifdef ENABLE_SERIAL_COMMANDS
 void printSerialCommandMenu() {
-  Serial.println("COMMANDS:");
-  Serial.println("[H] Help menu [R] Reboot [D] Display tests [W] Write EEPROM");
-  Serial.println("[L] Toggle update log [S] Toggle scale data log [P] Toggle port data log");
-  Serial.println("[0] Restore LED state [1] Blink red [2] Blink green [3] Blink blue");
-  Serial.println("[4] White on [5] Wave red [6] Wave green [7] Wave blue");
-  Serial.println("[O] Calib offsets [+] Select slot (+) [-] Select slot (-) [F] Calib slot " + String(slotSelected));
-  Serial.println("TEMP DEBUG OUTPUT: eepromData (use W to commit changes):");
-  printEepromData();
+  PRINTLN("COMMANDS:");
+  PRINTLN("[H] Help [R] Reboot [T] Test display [W] Write EEPROM");
+  PRINTLN("[0] Reset display [1] Sync LED state [2] Blink red [3] Blink green [4] Blink blue");
+  PRINTLN("[5] White on [6] Wave red [7] Wave green [8] Wave blue");
+  PRINTLN("[O] Calib offsets [+] Select slot (+) [-] Select slot (-) [F] Calib slot " + String(slotSelected));
+  PRINTLN("LOGGING: [U] Toggle Updates [S] Toggle Scale data [P] Toggle Port data");
+  PRINTLN("Config Data (use W to commit changes):");
+  printConfigData();
 }
-
+#endif
 void calibrateOffsets() {
   long int results[PORT_COUNT] = {0};
-  uint8_t i;
-  Serial.println("Calibrating offsets: sampling averages...");
+  DEBUG_PRINTLN("Calibrating offsets: sampling averages...");
   setAllLedStates(LED_CALIBRATING);
   getAverageScaleData(results, 10);
-  for (i = 0; i < PORT_COUNT; i++) {
+  for (uint8_t i = 0; i < PORT_COUNT; i++) {
     hx711_tare_offsets[i] = results[i];
-    // stage data for writing
-    eepromData.offsets[i] = results[i];
   }
   writeEeprom();
   restoreLedStates();
@@ -1156,13 +930,11 @@ void calibrateOffsets() {
 
 int calibrateScaleFactor(uint8_t slot) {
   long int results[PORT_COUNT] = {0};
-  Serial.println("Calibrating scale factor for Slot " + String(slot));
+  DEBUG_PRINTLN("Calibrating scale factor for Slot " + String(slot));
   setLedState(slot, LED_CALIBRATING);
   getAverageScaleData(results, 10);
   restoreLedStates();
   hx711_calibration_factors[slot] = 1.0 * (results[slot] - hx711_tare_offsets[slot]) / CALIBRATION_WEIGHT_KG;
-  // stage EEPROM data for writing
-  eepromData.calibration_factors[slot] = hx711_calibration_factors[slot];
   return hx711_calibration_factors[slot];
 }
 
@@ -1180,37 +952,41 @@ void getAverageScaleData(long *result, byte times) {
       calStats[i].add(values[i]);
     }
   }
-  Serial.println("Slot\tCount\tAvg\tMin\tMax\tStdev");
-  Serial.println("----\t-----\t---\t---\t---\t-----");
+  #ifdef DEBUG 
+  DEBUG_PRINTLN("Slot\tCount\tAvg\tMin\tMax\tStdev");
+  DEBUG_PRINTLN("----\t-----\t---\t---\t---\t-----");
   for (i = 0; i < scales.get_count(); i++) {
-    Serial.print(i);
-    Serial.print('\t');
-    Serial.print(calStats[i].count());
-    Serial.print('\t');
-    Serial.print((int)calStats[i].average());
-    Serial.print('\t');
-    Serial.print(calStats[i].minimum(), 0);
-    Serial.print('\t');
-    Serial.print(calStats[i].maximum(), 0);
-    Serial.print('\t');
-    Serial.println(calStats[i].pop_stdev(), 0);
+    DEBUG_PRINT(i);
+    DEBUG_PRINT('\t');
+    DEBUG_PRINT(calStats[i].count());
+    DEBUG_PRINT('\t');
+    DEBUG_PRINT((int)calStats[i].average());
+    DEBUG_PRINT('\t');
+    DEBUG_PRINTDP(calStats[i].minimum(), 0);
+    DEBUG_PRINT('\t');
+    DEBUG_PRINTDP(calStats[i].maximum(), 0);
+    DEBUG_PRINT('\t');
+    DEBUG_PRINTDP(calStats[i].pop_stdev(), 0);
+    DEBUG_PRINT('\n');
   }
+  #endif
 
 	// set the offsets
 	for (i = 0; i < PORT_COUNT; i++) {
 		result[i] = (int)calStats[i].average();
 	}
 }
-
+#ifdef ENABLE_SERIAL_COMMANDS
 void printScaleData() {
   scales.read(scale_results);
   for (uint8_t i = 0; i < scales.get_count(); ++i) {
-    Serial.print(scale_results[i]);
-    Serial.print("\t");
-    Serial.print(1.0 * (scale_results[i] - hx711_tare_offsets[i]) / hx711_calibration_factors[i], 4);
-    Serial.print((i != scales.get_count() - 1) ? "\t" : "\n");
+    DEBUG_PRINT(scale_results[i]);
+    DEBUG_PRINT("\t");
+    DEBUG_PRINTDP(1.0 * (scale_results[i] - hx711_tare_offsets[i]) / hx711_calibration_factors[i], 4);
+    DEBUG_PRINT((i != scales.get_count() - 1) ? "\t" : "\n");
   }
 }
+#endif
 
 /**
  * Reset SX1509 internal counters to synchronize LED operation (blinking, fading)
@@ -1244,51 +1020,60 @@ void syncLeds() {
     io[i].writeByte(REG_MISC, (regMisc & ~(1 << 2)));
   }
 }
-
-void printEepromData() {
-  Serial.println("device_id:           '" + String(eepromData.device_id) + "'");
-  Serial.println("wifi_ssid:           '" + String(eepromData.wifi_ssid) + "'");
-  Serial.println("wifi_password:       '" + String(eepromData.wifi_password) + "'");
-  Serial.println("firebase_project_id: '" + String(eepromData.firebase_project_id) + "'");
-  Serial.println("firebase_db_secret:  '" + String(eepromData.firebase_db_secret) + "'");
-  Serial.println("Slot\tOffset\tCal factor");
-  Serial.println("----\t------\t----------");
+#ifdef ENABLE_SERIAL_COMMANDS
+void printConfigData() {
+  PRINTLN("device_id:           '" + String(device_id) + "'");
+  PRINTLN("wifi_ssid:           '" + String(wifi_ssid) + "'");
+  PRINTLN("wifi_password:       '" + String(wifi_password) + "'");
+  PRINTLN("firebase_project_id: '" + String(firebase_project_id) + "'");
+  PRINTLN("firebase_db_secret:  '" + String(firebase_db_secret) + "'");
+  PRINTLN("led_on_intensity:     " + String(ledOnIntensity));
+  PRINTLN("Slot\tOffset\tCal factor");
+  PRINTLN("----\t------\t----------");
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
-    Serial.print(i);
-    Serial.print('\t');
-    Serial.print(eepromData.offsets[i]);
-    Serial.print('\t');
-    Serial.print(eepromData.calibration_factors[i]);
-    Serial.println();
+    PRINT(i);
+    PRINT('\t');
+    PRINT(hx711_tare_offsets[i]);
+    PRINT('\t');
+    PRINT(hx711_calibration_factors[i]);
+    PRINTLN();
   }
 }
-
+#endif
 void readEeprom() {
-  Serial.println("Reading EEPROM data...");
+  DEBUG_PRINTLN("Reading EEPROM data...");
   EEPROM.begin(EEPROM_LEN);
   EEPROM.get(EEPROM_ADDR, eepromData);
-  printEepromData();
   device_id = eepromData.device_id;
   wifi_ssid = eepromData.wifi_ssid;
   wifi_password = eepromData.wifi_password;
   firebase_project_id = eepromData.firebase_project_id;
   firebase_db_secret = eepromData.firebase_db_secret;
+  ledOnIntensity = eepromData.led_on_intensity;
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
     hx711_tare_offsets[i] = eepromData.offsets[i];
     hx711_calibration_factors[i] = eepromData.calibration_factors[i];
   }
+  #ifdef ENABLE_SERIAL_COMMANDS
+  printConfigData();
+  #endif
 }
 
 void writeEeprom() {
-  Serial.print("Writing EEPROM data to addr 0x" + String(EEPROM_ADDR, HEX));
-  Serial.println("...");
+  DEBUG_PRINTLN("Writing EEPROM data to addr 0x" + String(EEPROM_ADDR, HEX) + "...");
   strncpy(eepromData.device_id, device_id, 32);
   strncpy(eepromData.wifi_ssid, wifi_ssid, 64);
   strncpy(eepromData.wifi_password, wifi_password, 64);
   strncpy(eepromData.firebase_project_id, firebase_project_id, 64);
   strncpy(eepromData.firebase_db_secret, firebase_db_secret, 64);
-
-  printEepromData();
+  eepromData.led_on_intensity = ledOnIntensity;
+  for (uint8_t i = 0; i < PORT_COUNT; i++) {
+    eepromData.offsets[i] = hx711_tare_offsets[i];
+    eepromData.calibration_factors[i] = hx711_calibration_factors[i];
+  }
+  #ifdef ENABLE_SERIAL_COMMANDS
+  printConfigData();
+  #endif
   // commit 512 bytes (EEPROM_LEN) of ESP8266 flash (for "EEPROM" emulation)
   // this step actually loads the content (512 bytes) of flash into 
   // a 512-byte-array cache in RAM
@@ -1301,22 +1086,15 @@ void writeEeprom() {
   // in byte-array cache has been changed, but if so, ALL 512 bytes are 
   // written to flash
   if (EEPROM.commit()) {
-    Serial.println("commit succeeded.");
+    DEBUG_PRINTLN("commit succeeded.");
   } else {
-    Serial.println("commit FAILED.");
+    DEBUG_PRINTLN("commit FAILED.");
   }
 }
 
 void setupAP() {
-  Serial.print("SoftAP IP address: ");
-  Serial.println(WiFi.softAPIP());
-  Serial.print("Setting up access point with SSID '" + String(WIFI_AP_SSID) + "'...");
-  boolean result = WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD);
-  if (result) {
-    Serial.println("success.");
-  } else {
-    Serial.println("FAILED.");
-  }
+  PRINT("Setting up access point with SSID '" + String(WIFI_AP_SSID) + "'... ");
+  Serial.println(WiFi.softAP(WIFI_AP_SSID, WIFI_AP_PASSWORD) ? "success." : "FAILED.");
 }
 
 boolean wifiConnect() {
@@ -1345,20 +1123,20 @@ void setupFirebaseCallback() {
   url.replace("%%FIREBASE_PROJECT_ID%%", firebase_project_id);
   Firebase.begin(url, firebase_db_secret);
   Firebase.reconnectWiFi(true);
-  // Set the size of WiFi RX/TX buffers
-  //firebaseData.setBSSLBufferSize(1024, 1024);
+  // Set the size of WiFi RX/TX buffers (min 512 - max 16384)
+  //firebaseData.setBSSLBufferSize(512, 512);
   // Set the size of HTTP response buffers
   //firebaseData.setResponseSize(1024);
   // Set database read timeout to 1 minute (max 15 minutes)
   //Firebase.setReadTimeout(firebaseData, 1000 * 60);
   // Set write size limit and timeout: tiny (1s), small (10s), medium (30s), large (60s), or unlimited
   //Firebase.setwriteSizeLimit(firebaseData, "tiny");
+  
   Firebase.setStreamCallback(firebaseData, streamCallback, streamTimeoutCallback);
 
-  String path = "/ports/" + String(device_id);
-  if (!Firebase.beginStream(firebaseData, path)) {
+  if (!Firebase.beginStream(firebaseData, "/ports/" + String(device_id))) {
     // unable to begin stream connection
-    Serial.println(firebaseData.errorReason());
+    DEBUG_PRINTLN(firebaseData.errorReason());
   }
 }
 #endif
@@ -1371,29 +1149,30 @@ void reboot() {
 void setup() {
   Serial.begin(115200);
   delay(10);
-  Serial.println('\n');
-  Serial.println(BOOT_MESSAGE);
+  PRINTLN('\n');
+  PRINTLN(BOOT_MESSAGE);
   Serial.flush();
 
   readEeprom();
-  randomSeed(analogRead(0)); // seed with random noise for misc functions
+  #ifdef ENABLE_LED_EFFECTS
+  randomSeed(analogRead(0)); // seed with random noise for ledRandom()
+  #endif
 
   // Initialize SX1509 I/O expanders
   for (uint8_t i = 0; i < SX1509_COUNT; i++) {
-    Serial.print("Initializing SX1509 device " + String(i) + " at address 0x");
-    Serial.print(SX1509_I2C_ADDRESSES[i], HEX);
-    Serial.print("...");
+    DEBUG_PRINT("Initializing SX1509 device " + String(i) + " at address 0x");
+    DEBUG_PRINT(String(SX1509_I2C_ADDRESSES[i], HEX));
+    DEBUG_PRINT("...");
     if (!io[i].begin(SX1509_I2C_ADDRESSES[i])) {
-      Serial.println(" FAILED.");
+      DEBUG_PRINTLN(" FAILED.");
       // [eschwartz-TODO] Set flag to skip I/O stuff or light an error LED
     } else {
-      Serial.println(" success.");
+      DEBUG_PRINTLN(" success.");
     }
   }
   // Set output frequency: 0x0: 0Hz (low), 0xF: 2MHz? (high),
   // 0x1-0xE: fOSCout = Fosc / 2 ^ (outputFreq - 1) Hz
-  byte outputFreq = 0xF;
-  io[0].clock(INTERNAL_CLOCK_2MHZ, 2, OUTPUT, outputFreq);
+  io[0].clock(INTERNAL_CLOCK_2MHZ, 2, OUTPUT, 0xF);
   io[1].clock(EXTERNAL_CLOCK, 2, INPUT);
 
   // Setup input pin to trigger external interrupt on shared nReset lines
@@ -1405,14 +1184,12 @@ void setup() {
   // Set up all LED pins as ANALOG_OUTPUTs
   for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
     for (uint8_t color = 0; color < COLOR_COUNT; color++) {
-      uint8_t device = led_pins[pos][color][DEV];
-      uint8_t pin = led_pins[pos][color][PIN];
-      io[device].pinMode(pin, ANALOG_OUTPUT);      
+      io[led_pins[pos][color][DEV]].pinMode(led_pins[pos][color][PIN], ANALOG_OUTPUT);      
     }
   }
 
   // Start LED wave to indicate initializing
-  ledWaveRight(1, 0, 0);
+  ledWaveRight(LED_RED_BREATHE);
 
   // Initialize port structs
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
@@ -1425,21 +1202,23 @@ void setup() {
 
   Serial.print("SoftAP IP address: ");
   Serial.println(WiFi.softAPIP());
-  Serial.print("Connecting to WiFi...");
+  Serial.println("Connecting to WiFi (timeout in " + String(WIFI_CONNECT_TIMEOUT_MS) + " ms)...");
   if (wifiConnect()) {
-    Serial.print("\nConnected to " + WiFi.SSID());
-    Serial.print("IP address: " + WiFi.localIP());
+    Serial.print("\nConnected to ");
+    Serial.println(WiFi.SSID());
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
   } else {
-    Serial.println("connection timed out, setting up access point...");
+    PRINTLN("connection timed out, setting up access point...");
     setupAP();
   }
   
   #ifdef MDNS
   // Start the mDNS responder for esp8266.local
   if (MDNS.begin("esp8266")) {
-    Serial.println("mDNS responder started");
+    DEBUG_PRINTLN("mDNS responder started");
   } else {
-    Serial.println("Error setting up MDNS responder!");
+    DEBUG_PRINTLN("Error setting up MDNS responder!");
   }
   #endif
 
@@ -1447,13 +1226,15 @@ void setup() {
   // Set up callbacks for client URIs
   server.on("/", handleRoot);
   server.on("/settings", handleSettings);
+  #ifdef ENABLE_CALIBRATE
   server.on("/calib", handleCalibrate);
+  #endif
   server.on("/util", handleUtil);
   server.on("/loading", handleLoading);
   server.onNotFound(handleRoot);
   // Start the HTTP server
   server.begin();
-  Serial.println("HTTP server started");
+  DEBUG_PRINTLN("HTTP server started");
   #endif
   
   // Get initial port data via REST call to Firebase
@@ -1464,8 +1245,9 @@ void setup() {
   #ifdef USE_FIREBASE_CALLBACK
   setupFirebaseCallback();
   #endif
-
+  #ifdef ENABLE_SERIAL_COMMANDS
   printSerialCommandMenu();
+  #endif
 }
 
 void loop() {
@@ -1475,13 +1257,24 @@ void loop() {
   #endif
 
   scales.read(scale_results);
-  if (enablePrintScaleData) printScaleData();
-  if (enableLogData) printCurrentValues();
+  #ifdef ENABLE_SERIAL_COMMANDS
+  if (enablePrintScaleData) {
+    printScaleData();
+  }
+  if (enableLogData) {
+    printCurrentValues();
+  }
+  #endif
+
+  if (rebootRequired && (millis() >= rebootTimeMillis)) {
+    reboot();
+  }
 
   for (uint8_t i = 0; i < PORT_COUNT; i++) {
     float kg_change = 0;
     // Get current weight reading, apply offset and calibratation factor
-    float weight_kilograms = MAX(1.0 * (scale_results[i] - hx711_tare_offsets[i]) / hx711_calibration_factors[i], 0);
+    float weight_kilograms = MAX(1.0 *
+      (scale_results[i] - hx711_tare_offsets[i]) / hx711_calibration_factors[i], 0);
     // Add current reading to stats arrays
     ports[i].stats.add(weight_kilograms);
     // Save current reading
@@ -1494,10 +1287,10 @@ void loop() {
         kg_change = fabs(ports[i].stats.average() - ports[i].last_weight_kilograms);
       }
       /**
-       * Print log message and send update when conditions are met:
+       * Print log message and send update to cloud when conditions are met:
        * - average reading exceeds PRESENCE_THRESHOLD_KG (i.e. object is present)
        * - average reading changed KG_CHANGE_THRESHOLD or more since last update
-       * - standard deviation within 0.03 kg
+       * - standard deviation within STD_DEV_THRESHOLD kg
        * - at least WEIGHT_MEASURE_INTERVAL_MS has passed since last update
        */
       if (!ports[i].lastWeightMeasurementPushMillis ||
@@ -1505,7 +1298,11 @@ void loop() {
             && (ports[i].stats.pop_stdev() <= STD_DEV_THRESHOLD)
             && ((millis() - ports[i].lastWeightMeasurementPushMillis) >= WEIGHT_MEASURE_INTERVAL_MS))) {
         // Log it
-        if (enableLogUpdates) printLogMessage(i, kg_change);
+        #ifdef ENABLE_SERIAL_COMMANDS
+        if (enableLogUpdates) {
+          printLogMessage(i, kg_change);
+        }
+        #endif
         if (WiFi.status() == WL_CONNECTED) {
           // Send new weight_kg to Realtime Database via HTTP function
           if (setWeight(device_id, i, ports[i].stats.average())) {
@@ -1513,11 +1310,9 @@ void loop() {
             ports[i].last_weight_kilograms = ports[i].stats.average();
             ports[i].lastWeightMeasurementPushMillis = millis();
           }
-        } else {
-          Serial.println("No WiFi connection, skipping update");
         }
         // Reset LED based on current port status
-        setLedState(i, statusToLedState(ports[i].status));
+        setLedState(i, STATUS_TO_LED_STATE[ports[i].status]);
       }
       ports[i].stats.clear();
     }
@@ -1525,39 +1320,37 @@ void loop() {
 
   if (Serial.available()) {
     char key = Serial.read();
+    if (key == 'r' || key == 'R') {
+      PRINTLN("Rebooting device...");
+      reboot();
+    }
+    #ifdef ENABLE_SERIAL_COMMANDS
     if ((key == 'h') || (key == 'H') || (key == '?')) {
       printSerialCommandMenu();
     }
-    if (key == 'r' || key == 'R') {
-      Serial.println("Rebooting device...");
-      reboot();
-    }
     if (key == 'p' || key == 'P') {
       enableLogData = !enableLogData;
-      Serial.print("Data logging is ");
-      Serial.println(enableLogData ? "ON" : "OFF");
+      PRINT("Data logging is ");
+      PRINTLN(enableLogData ? "ON" : "OFF");
     }
     if (key == 's' || key == 'S') {
       enablePrintScaleData = !enablePrintScaleData;
-      Serial.print("Scale data logging is ");
-      Serial.println(enablePrintScaleData ? "ON" : "OFF");
+      PRINT("Scale data logging is ");
+      PRINTLN(enablePrintScaleData ? "ON" : "OFF");
       if (enablePrintScaleData) {
         for (uint8_t i = 0; i < PORT_COUNT; i++) {
-          Serial.print("s" + String(i) + " raw\ts" + String(i) + " kg\t");
+          PRINT("s" + String(i) + " raw\ts" + String(i) + " kg\t");
         }
-        Serial.print("\n");
+        PRINT("\n");
       }
     }
-    if (key == 'l' || key == 'L') {
+    if (key == 'u' || key == 'U') {
       enableLogUpdates = !enableLogUpdates;
-      Serial.print("Update logging is ");
-      Serial.println(enableLogUpdates ? "ON" : "OFF");
+      PRINT("Update logging is ");
+      PRINTLN(enableLogUpdates ? "ON" : "OFF");
     }
     if (key == 'w' || key == 'W') {
       writeEeprom();
-    }
-    if (key == 'd' || key == 'D') {
-      displayTest();
     }
     if ((key == 'o') || (key == 'O')) {
       calibrateOffsets();
@@ -1566,63 +1359,59 @@ void loop() {
       calibrateScaleFactor(slotSelected);
     }
     if (key == '0') {
-      Serial.println("Restoring LED state...");
-      restoreLedStates();
+      PRINTLN("Resetting display...");
+      resetDisplay();
     }
     if (key == '1') {
-      Serial.println("Setting all LEDs to LED_RED_BLINK state...");
-      for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
-        setLedState(pos, LED_RED_BLINK);
-      }
+      PRINTLN("Restoring LED state...");
+      restoreLedStates();
     }
     if (key == '2') {
-      Serial.println("Setting all LEDs to LED_GREEN_BLINK state...");
-      for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
-        setLedState(pos, LED_GREEN_BLINK);
-      }
+      PRINTLN("Setting all LEDs to LED_RED_BLINK state...");
+      setAllLedStates(LED_RED_BLINK);
     }
     if (key == '3') {
-      Serial.println("Setting all LEDs to LED_BLUE_BLINK state...");
-      for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
-        setLedState(pos, LED_BLUE_BLINK);
-      }
+      PRINTLN("Setting all LEDs to LED_GREEN_BLINK state...");
+      setAllLedStates(LED_GREEN_BLINK);
     }
     if (key == '4') {
-      Serial.println("Setting all LEDs to LED_WHITE state...");
-      for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
-        setLedState(pos, LED_WHITE);
-      }
+      PRINTLN("Setting all LEDs to LED_BLUE_BLINK state...");
+      setAllLedStates(LED_BLUE_BLINK);
     }
     if (key == '5') {
-      Serial.println("Setting red wave pattern...");
-      ledWaveRight(1, 0, 0);
+      PRINTLN("Setting all LEDs to LED_WHITE state...");
+      setAllLedStates(LED_WHITE);
     }
+    #ifdef ENABLE_LED_EFFECTS
     if (key == '6') {
-      Serial.println("Setting green wave pattern...");
-      ledWaveRight(0, 1, 0);
+      PRINTLN("Setting red wave pattern...");
+      ledWaveRight(LED_RED_BREATHE);
     }
     if (key == '7') {
-      Serial.println("Setting blue wave pattern...");
-      ledWaveRight(0, 0, 1);
+      PRINTLN("Setting green wave pattern...");
+      ledWaveRight(LED_GREEN_BREATHE);
     }
+    if (key == '8') {
+      PRINTLN("Setting blue wave pattern...");
+      ledWaveRight(LED_BLUE_BREATHE);
+    }
+    if (key == 't' || key == 't') {
+      displayTest();
+    }
+    #endif
     if (key == '+') {
       if (slotSelected < (PORT_COUNT - 1)) slotSelected++;
-      Serial.println("Slot " + String(slotSelected) + " is selected");
+      PRINTLN("Slot " + String(slotSelected) + " is selected");
     }
     if (key == '-') {
       if (slotSelected > 0) slotSelected--;
-      Serial.println("Slot " + String(slotSelected) + " is selected");
+      PRINTLN("Slot " + String(slotSelected) + " is selected");
     }
     if (key == 'x') {
-      Serial.println("Clearing display...");
-      for (uint8_t pos = 0; pos < PORT_COUNT; pos++ ) {
-        setLedState(pos, LED_OFF);
-      }
+      PRINTLN("Clearing display...");
+      setAllLedStates(LED_OFF);
     }
+    #endif
   }
-
-  if (rebootRequired && (millis() >= rebootTimeMillis)) {
-    //writeEeprom();
-    reboot();
-  }
+  
 }
