@@ -7,7 +7,7 @@
 
 ## Cerealometer HW
 
-This repo contains hardware specs, building instructions, and embedded firmware for Cerealometer, an IoT-enabled cereal measuring solution designed to mitigate the impact of breakfast outages.
+This repo contains hardware specs, building instructions, and embedded firmware for Cerealometer, an IoT-enabled cereal measurement solution designed to mitigate the impact of breakfast outages.
 
 For the Cerealometer app and its cloud infrastructure, visit the [main Cerealometer repo here](https://github.com/ahtraddis/cerealometer).
 
