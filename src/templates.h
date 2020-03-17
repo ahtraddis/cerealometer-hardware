@@ -13,8 +13,8 @@
   .d {opacity: .4}
   input[type=text], input[type=password] {width: 15em;}
   input.wide {width: 30em;}
-  label {margin-bottom: 5px;}
-  .toglab {font-size: smaller; color: #777; margin-left: .3em;}
+  label {font-size: 14px; margin-bottom: 5px; font-weight: bold;}
+  .toglab {font-size: smaller; font-weight: normal; color: #777; margin-left: .3em;}
   small {color: #777}
   .w {width: 800px; margin: 0 auto; background: #fff;}
   .h {background: #eee; padding: 20px; border-radius: 10px; margin-top: 1em;}
@@ -22,7 +22,7 @@
   .pr {color: #fff; font-family: sans-serif;}
 </style>
 */
-String styleHtmlTemplate = R"foo(<style type="text/css">body,nav{background:#20162d}.cntr{margin:0 20px 0 20px;padding-bottom:25px}.c, tr.c th,td.c{text-align:center}.r,td.r{text-align:right}.d{opacity: .4}input[type=text],input[type=password]{width:15em}input.wide{width:30em}label{margin-bottom:5px}.toglab{font-size:smaller;color:#777;margin-left:.3em}small{color:#777}.w{width:800px;margin:0 auto;background:#fff}.h{background:#eee;padding:20px;border-radius:10px;margin-top:1em}.vhc{display:flex;align-items:center;justify-content:center}.pr{color:#fff;font-family:sans-serif}</style>)foo";
+String styleHtmlTemplate = R"foo(<style type="text/css">body,nav{background:#20162d}.cntr{margin:0 20px 0 20px;padding-bottom:25px}.c, tr.c th,td.c{text-align:center}.r,td.r{text-align:right}.d{opacity: .4}input[type=text],input[type=password]{width:15em}input.wide{width:30em}label{font-size:14px;margin-bottom:5px;font-weight:bold}.toglab{font-size:smaller;font-weight:normal;color:#777;margin-left: .3em}small{color:#777}.w{width:800px;margin:0 auto;background:#fff}.h{background:#eee;padding:20px;border-radius:10px;margin-top:1em}.vhc{display:flex;align-items:center;justify-content:center}.pr{color:#fff;font-family:sans-serif}</style>)foo";
 
 /*
 <script type="text/javascript">
@@ -171,18 +171,11 @@ String calibrateRowHtmlTemplate = R"foo(<tr><td class="r">{PORT}</td><td class="
 /*
 <h2>Utilities</h2>
 <form method="POST" action="/util">
-  <input name="reboot" type="hidden" />
-  <input class="btn smooth btn-sm" value="Reboot" type="submit" />
-</form>
-<form method="POST" action="/util">
-  <input name="displaytest" type="hidden" />
-  <input class="btn smooth btn-sm" value="Run display tests" type="submit" />
+  <input class="btn smooth btn-sm" value="Reboot" name="reboot" type="submit" />
+  <input class="btn smooth btn-sm" value="Run display tests" name="displaytest" type="submit" />
 </form>
 */
-String utilHtmlTemplate = R"foo(<h2>Utilities</h2><form method="POST" action="/util"><input name="reboot" type="hidden" /><input class="btn smooth btn-sm" value="Reboot" type="submit" /></form>)foo";
-#ifdef ENABLE_LED_EFFECTS
-    utilHtmlTemplate += R"foo(<form method="POST" action="/util"><input name="displaytest" type="hidden" /><input class="btn smooth btn-sm" value="Run display tests" type="submit" /></form>)foo";
-#endif
+String utilHtmlTemplate = R"foo(<h2>Utilities</h2><form method="POST" action="/util"> <input class="btn smooth btn-sm" value="Reboot" name="reboot" type="submit" /> <input class="btn smooth btn-sm" value="Run display tests" name="displaytest" type="submit" /></form>)foo";
 
 /*
 <!DOCTYPE html>

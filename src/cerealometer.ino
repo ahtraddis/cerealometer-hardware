@@ -326,20 +326,23 @@ int setWeight(String device_id, int slot, float weight_kg) {
     + String("}");
   // [eschwartz-TODO]: This should probably be a PUT to /ports/<device_id>/data/<slot>
   int httpCode = http.POST(data);
-
-  if (httpCode > 0) {
-    DEBUG_PRINT("Slot ");
-    DEBUG_PRINT(slot);
-    DEBUG_PRINT(" setWeight SUCCESS, httpCode = ");
-    DEBUG_PRINTLN(httpCode);
-  } else {
-    DEBUG_PRINT("Slot ");
-    DEBUG_PRINT(slot);
-    DEBUG_PRINT(" setWeight FAILED: httpCode = ");
-    DEBUG_PRINT(httpCode);
-    DEBUG_PRINT(", error = ");
-    DEBUG_PRINTLN(http.errorToString(httpCode));
+  #ifdef ENABLE_SERIAL_COMMANDS
+  if (enableLogUpdates) {
+    if (httpCode > 0) {
+      DEBUG_PRINT("Slot ");
+      DEBUG_PRINT(slot);
+      DEBUG_PRINT(" setWeight SUCCESS, httpCode = ");
+      DEBUG_PRINTLN(httpCode);
+    } else {
+      DEBUG_PRINT("Slot ");
+      DEBUG_PRINT(slot);
+      DEBUG_PRINT(" setWeight FAILED: httpCode = ");
+      DEBUG_PRINT(httpCode);
+      DEBUG_PRINT(", error = ");
+      DEBUG_PRINTLN(http.errorToString(httpCode));
+    }
   }
+  #endif
   http.end();
 }
 #ifdef ENABLE_SERIAL_COMMANDS
@@ -409,16 +412,16 @@ void displayTest() {
   ledBreatheRow(B, ledOnIntensity, delayMs, delayStepMs);
   delay(100);
   // Fade in/out rows with simple color combinations
-  delayStepMs = 0;
+  delayStepMs = 1;
   for (uint8_t i = 0; i < LEN(rgbSeq); i++) {
     ledFadeUpRow(rgbSeq[i][R], rgbSeq[i][G], rgbSeq[i][B], ledOnIntensity, delayMs, delayStepMs);
     ledFadeDownRow(rgbSeq[i][R], rgbSeq[i][G], rgbSeq[i][B], ledOnIntensity, delayMs, delayStepMs);
     delay(500);
   }
   delay(100);
-  ledRandom(50);
+  ledRandom(20);
   resetDisplay();
-  delay(1000);
+  delay(500);
   restoreLedStates();
   DEBUG_PRINTLN("...done.");
 }
@@ -536,15 +539,12 @@ void checkStopBlinkBreathe(uint8_t pos) {
   byte state = currentLedStates[pos];
   if ((state == LED_RED_BLINK) || (state == LED_RED_BLINK_FAST) || (state == LED_UNLOADED)
       || (LED_CLEARING) || (state == LED_RED_BREATHE)) {
-    DEBUG_PRINTLN("checkStopBlink: stop red blink: pos: " + String(pos));
     io[RDEV].setupBlink(RPIN, 0, 0, 255); // stop red blink
   }
   if ((state == LED_GREEN_BLINK) || (state == LED_GREEN_BREATHE) || (state == LED_INITIALIZING)) {
-    DEBUG_PRINTLN("checkStopBlink: stop green blink: pos: " + String(pos));
     io[GDEV].setupBlink(GPIN, 0, 0, 255); // stop green blink
   }
   if ((state == LED_BLUE_BLINK) || (state == LED_BLUE_BREATHE)) {
-    DEBUG_PRINTLN("checkStopBlink: stop blue blink: pos: " + String(pos));
     io[BDEV].setupBlink(BPIN, 0, 0, 255); // stop blue blink
   }
 }
@@ -907,12 +907,12 @@ void handleLoading() {
 #ifdef ENABLE_SERIAL_COMMANDS
 void printSerialCommandMenu() {
   PRINTLN("COMMANDS:");
-  PRINTLN("[H] Help [R] Reboot [T] Test display [W] Write EEPROM");
+  PRINTLN("[H] Help [R] Reboot [T] Test display");
   PRINTLN("[0] Reset display [1] Sync LED state [2] Blink red [3] Blink green [4] Blink blue");
   PRINTLN("[5] White on [6] Wave red [7] Wave green [8] Wave blue");
   PRINTLN("[O] Calib offsets [+] Select slot (+) [-] Select slot (-) [F] Calib slot " + String(slotSelected));
   PRINTLN("LOGGING: [U] Toggle Updates [S] Toggle Scale data [P] Toggle Port data");
-  PRINTLN("Config Data (use W to commit changes):");
+  PRINTLN("CONFIG DATA:");
   printConfigData();
 }
 #endif
@@ -1348,9 +1348,6 @@ void loop() {
       enableLogUpdates = !enableLogUpdates;
       PRINT("Update logging is ");
       PRINTLN(enableLogUpdates ? "ON" : "OFF");
-    }
-    if (key == 'w' || key == 'W') {
-      writeEeprom();
     }
     if ((key == 'o') || (key == 'O')) {
       calibrateOffsets();
